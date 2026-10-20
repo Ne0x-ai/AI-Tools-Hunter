@@ -1,0 +1,25 @@
+[project]
+name = "ai-tools-hunter"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28",
+    "fastapi>=0.115",
+    "publicsuffix2>=2.20191221",
+    "uvicorn>=0.30",
+    "cryptography>=42",
+]
+
+[project.scripts]
+ai-tools-hunter = "ai_tools_hunter.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=9.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]

@@ -1,0 +1,51 @@
+"""Regression tests for QA-flagged bugs.
+
+Each test ties to an issue in
+    .gstack/qa-reports/qa-report-127-0-0-1-8000-2026-08-31.md
+and pins the fix so it cannot silently break again.
+"""
+
+from datetime import UTC, datetime
+
+from fastapi.testclient import TestClient
+
+from ai_tools_hunter.api import create_app
+from ai_tools_hunter.domain.candidates import (
+    CandidateOutcome,
+    CandidateVersionDraft,
+    Evidence,
+    EvidenceType,
+)
+from ai_tools_hunter.domain.reviews import ReviewAction, build_review_decision
+from ai_tools_hunter.storage.sqlite import SQLiteStore
+
+
+NOW = datetime(2026, 8, 16, tzinfo=UTC)
+
+
+
+def _seed_approved_human_version(store: SQLiteStore) -> tuple[str, int]:
+    candidate = store.create_candidate("example.com", created_at=NOW)
+    version = store.append_candidate_version(
+        candidate.candidate_id,
+        CandidateVersionDraft(
+            author_kind="human",
+            primary_outcome=CandidateOutcome.PUBLISHABLE_AI_SAAS,
+            classification_confidence=0.9,
+            name_suggestion="Example AI",
+            description_suggestion="AI workflow automation",
+            evidence=(Evidence(EvidenceType.TITLE, "Example AI", "https://example.com"),),
+        ),
+        created_at=NOW,
+    )
+    store.append_review_decision(
+        build_review_decision(
+            request_id="approve-regression",
+            candidate_id=candidate.candidate_id,
+            candidate_version=version.version,
+            action=ReviewAction.APPROVE,
+            actor_id="reviewer-1",
+            decided_at=NOW,
+        )
+    )
+    return candidate.candidate_id, version.version

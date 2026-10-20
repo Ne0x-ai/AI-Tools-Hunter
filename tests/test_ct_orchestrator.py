@@ -1,0 +1,986 @@
+"""Integration tests for the CT → candidate orchestrator.
+
+The poller is fed by a hand-rolled fake fetcher (no httpx), so these tests
+prove the wiring between ``CTPoller`` → ``SQLiteStore`` →
+``AIToolsHunterPipeline.probe_domain`` without touching the real network.
+
+The probe is a fake that returns canned ``L1Analysis`` values per hostname
+so we can deterministically exercise both the publishable and the
+no-candidate paths.
+"""
+
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Mapping
+
+import pytest
+
+from ai_tools_hunter.crawler.http_probe import ProbeResult
+from ai_tools_hunter.domain.candidates import (
+    CandidateOutcome,
+    CandidateVersionDraft,
+    Evidence,
+    EvidenceType,
+)
+from ai_tools_hunter.crawler.l1_analysis import L1Analysis
+from ai_tools_hunter.domain.observations import OutcomeCode
+from ai_tools_hunter.filter.dns_check import DnsResult
+from ai_tools_hunter.filter.pipeline import FilterDecision, FilterPipeline
+from ai_tools_hunter.filter.rdap_age import MemoryCache, Registration
+from ai_tools_hunter.domain.events import SourceEvent
+from ai_tools_hunter.ingest.ct_events import build_ct_events
+from ai_tools_hunter.ingest.ct_orchestrator import (
+    CTIngestOrchestrator,
+    CTIngestRunSummary,
+)
+from ai_tools_hunter.ingest.ct_poller import CTCertificate, CTPage, CTPoller
+from ai_tools_hunter.llm.provider import MockLLMProvider
+from ai_tools_hunter.pipeline import AIToolsHunterPipeline
+from ai_tools_hunter.storage.sqlite import SQLiteStore
+
+
+_OBSERVED = datetime(2026, 8, 20, 6, 0, tzinfo=UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class _FakeProbe:
+    """In-memory probe: each hostname maps to a canned L1Analysis."""
+
+    responses: Mapping[str, L1Analysis]
+
+    async def probe(self, hostname: str) -> ProbeResult:
+        analysis = self.responses.get(hostname)
+        if analysis is None:
+            return ProbeResult(
+                outcome_code=OutcomeCode.DNS_NOT_FOUND,
+                final_url=None,
+                analysis=None,
+                detail="no canned response",
+            )
+        return ProbeResult(
+            outcome_code=analysis.outcome_code,
+            final_url=analysis.final_url,
+            analysis=analysis,
+        )
+
+
+class _ExplodingProbe:
+    """A probe that models a process-stopping failure after CT persistence."""
+
+    async def probe(self, hostname: str) -> ProbeResult:
+        raise RuntimeError(f"probe interrupted for {hostname}")
+
+
+class _FakeFilterPipeline:
+    """Records the strict-mode inputs, then delegates to a real funnel.
+
+    Delegating (rather than hand-building ``FilterDecision`` objects) keeps the
+    real ``FilteredCandidate``/``AgeVerdict`` shape flowing into verification
+    persistence. Domains outside ``kept_domains`` get an over-age registration
+    so the funnel drops them terminally.
+    """
+
+    def __init__(self, kept_domains: set[str]) -> None:
+        self._kept_domains = kept_domains
+        self.calls: list[tuple[tuple[str, ...], datetime]] = []
+
+    def _registration(self, domain: str, observed_at: datetime) -> Registration:
+        age = (
+            timedelta(days=2)
+            if domain in self._kept_domains
+            else timedelta(days=365 * 5)
+        )
+        return Registration(
+            domain=domain,
+            registration_date=observed_at - age,
+            registrar="Fake Registrar",
+            statuses=(),
+        )
+
+    def evaluate(
+        self, domains: list[str], *, observed_at: datetime | None = None
+    ) -> tuple[FilterDecision, ...]:
+        assert observed_at is not None
+        self.calls.append((tuple(domains), observed_at))
+        funnel = FilterPipeline(
+            cache=MemoryCache(),
+            rdap_fetcher=lambda domain: self._registration(domain, observed_at),
+            dns_checker=lambda kept: {
+                domain: DnsResult(domain=domain, has_a=True, addresses=("1.2.3.4",))
+                for domain in kept
+            },
+            require_dns=True,
+            drop_unknown_rdap=True,
+        )
+        return funnel.evaluate(domains, observed_at=observed_at)
+
+
+def _ai_publishable(domain: str) -> L1Analysis:
+    return L1Analysis(
+        outcome_code=OutcomeCode.SUCCESS,
+        final_url=f"https://{domain}",
+        title=f"AI Platform for {domain}",
+        meta_description="AI assistant platform with free trial pricing.",
+        text_length=1200,
+        is_parking_page=False,
+        status_code=200,
+    )
+
+
+def _empty_success(domain: str) -> L1Analysis:
+    return L1Analysis(
+        outcome_code=OutcomeCode.SUCCESS,
+        final_url=f"https://{domain}",
+        title=None,
+        meta_description=None,
+        text_length=80,
+        is_parking_page=False,
+        status_code=200,
+    )
+
+
+def _redirected_ai_publishable(final_domain: str) -> L1Analysis:
+    return L1Analysis(
+        outcome_code=OutcomeCode.SUCCESS,
+        final_url=f"https://{final_domain}",
+        title="AI Platform",
+        meta_description="AI assistant platform with free trial pricing.",
+        text_length=1200,
+        is_parking_page=False,
+        status_code=200,
+    )
+
+
+def _cert(cert_id: str, hostname: str) -> CTCertificate:
+    cert_data = {
+        "leaf_cert": {
+            "subject": {"CN": hostname},
+            "all_domains": [hostname],
+            "issuer": "Test CA",
+        }
+    }
+    events = build_ct_events(cert_data, cert_id, _OBSERVED)
+    return CTCertificate(
+        source_event_id=cert_id,
+        certificate=cert_data,
+        observed_at=_OBSERVED,
+    )
+
+
+def _make_poller(store: SQLiteStore, pages: tuple[CTPage, ...]) -> CTPoller:
+    queue = list(pages)
+
+    async def fetch(cursor: str | None) -> CTPage:
+        if not queue:
+            return CTPage(entries=(), next_cursor=cursor)
+        return queue.pop(0)
+
+    return CTPoller(store=store, fetch_page=fetch)
+
+
+def _run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def test_poll_then_probe_creates_publishable_candidate(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    page = CTPage(
+        entries=(
+            _cert("c1", "nova-ai.com"),
+            _cert("c2", "brightcanvas.io"),
+        ),
+        next_cursor="c2",
+    )
+    poller = _make_poller(store, (page,))
+    probe = _FakeProbe(
+        {
+            "nova-ai.com": _ai_publishable("nova-ai.com"),
+            "brightcanvas.io": _ai_publishable("brightcanvas.io"),
+        }
+    )
+    pipeline = AIToolsHunterPipeline(store=store, probe=probe)  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store, poller=poller, pipeline=pipeline, probe_limit=10
+    )
+
+    async def go() -> None:
+        summary = await orchestrator.run_once(observed_at=_OBSERVED)
+        assert summary.certificates_seen == 2
+        assert summary.events_added == 2  # 2 certs × 1 hostname each
+        assert summary.probes_run == 2
+        assert summary.candidates_created == 2
+        assert summary.next_cursor == "c2"
+
+    _run(go())
+    domains = set(store.list_domains())
+    assert domains == {"nova-ai.com", "brightcanvas.io"}
+    queue = store.list_review_queue()
+    queue_domains = {item.candidate.domain for item in queue}
+    assert queue_domains == domains
+    for item in queue:
+        assert item.latest_version is not None
+        assert item.priority is not None
+
+
+def test_respects_probe_limit(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    page = CTPage(
+        entries=tuple(_cert(f"c{i}", f"site-{i}.ai") for i in range(5)),
+        next_cursor="c4",
+    )
+    poller = _make_poller(store, (page,))
+    probe = _FakeProbe({})
+    pipeline = AIToolsHunterPipeline(store=store, probe=probe)  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store, poller=poller, pipeline=pipeline, probe_limit=3
+    )
+
+    async def go() -> None:
+        summary = await orchestrator.run_once(observed_at=_OBSERVED)
+        assert summary.probes_run == 3
+        assert summary.candidates_created == 0  # all probes returned no candidate
+        assert summary.events_added == 5
+
+    _run(go())
+
+
+def test_drains_ct_roots_left_over_the_probe_limit_on_the_next_round(tmp_path) -> None:
+    """A bounded round must queue surplus CT roots instead of discarding them."""
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    domains = tuple(f"site-{index}.ai" for index in range(5))
+    page = CTPage(
+        entries=tuple(_cert(f"c{index}", domain) for index, domain in enumerate(domains)),
+        next_cursor="c4",
+    )
+    poller = _make_poller(store, (page,))
+    probe = _FakeProbe({domain: _ai_publishable(domain) for domain in domains})
+    pipeline = AIToolsHunterPipeline(store=store, probe=probe)  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store, poller=poller, pipeline=pipeline, probe_limit=3
+    )
+
+    first = _run(orchestrator.run_once(observed_at=_OBSERVED))
+    second = _run(orchestrator.run_once(observed_at=_OBSERVED))
+
+    assert first.probes_run == 3
+    assert first.candidates_created == 3
+    assert first.pending_work == 2
+    assert second.probes_run == 2
+    assert second.candidates_created == 2
+    assert second.pending_work == 0
+    assert {item.candidate.domain for item in store.list_review_queue()} == set(domains)
+
+
+def test_claims_events_created_during_the_current_poll_without_an_extra_round(tmp_path) -> None:
+    """A CT event stamped during polling is due in the same discovery round."""
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+
+    async def fetch_page(_cursor: str | None) -> CTPage:
+        return CTPage(
+            entries=(
+                CTCertificate(
+                    source_event_id="c1",
+                    certificate={
+                        "leaf_cert": {
+                            "subject": {"CN": "fresh-now.dev"},
+                            "all_domains": ["fresh-now.dev"],
+                        }
+                    },
+                    observed_at=datetime.now(UTC),
+                ),
+            ),
+            next_cursor="c1",
+        )
+
+    orchestrator = CTIngestOrchestrator(
+        store=store,
+        poller=CTPoller(store=store, fetch_page=fetch_page),
+        pipeline=AIToolsHunterPipeline(store=store, probe=_FakeProbe({})),  # type: ignore[arg-type]
+        probe_limit=1,
+    )
+
+    summary = _run(orchestrator.run_once())
+
+    assert summary.events_added == 1
+    assert summary.probes_run == 1
+
+
+def test_recovers_ct_work_after_a_probe_crash_advances_the_source_cursor(tmp_path) -> None:
+    """An interrupted page remains discoverable after its source cursor has advanced."""
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    page = CTPage(entries=(_cert("c1", "recoverable.ai"),), next_cursor="c1")
+    failed_poller = _make_poller(store, (page,))
+    failed_pipeline = AIToolsHunterPipeline(store=store, probe=_ExplodingProbe())  # type: ignore[arg-type]
+    failed_orchestrator = CTIngestOrchestrator(
+        store=store, poller=failed_poller, pipeline=failed_pipeline, probe_limit=1
+    )
+
+    with pytest.raises(RuntimeError, match="probe interrupted"):
+        _run(failed_orchestrator.run_once(observed_at=_OBSERVED))
+
+    recovered_poller = _make_poller(store, ())
+    recovered_pipeline = AIToolsHunterPipeline(
+        store=store,
+        probe=_FakeProbe({"recoverable.ai": _ai_publishable("recoverable.ai")}),
+    )  # type: ignore[arg-type]
+    recovered_orchestrator = CTIngestOrchestrator(
+        store=store, poller=recovered_poller, pipeline=recovered_pipeline, probe_limit=1
+    )
+
+    summary = _run(recovered_orchestrator.run_once(observed_at=_OBSERVED))
+
+    assert summary.events_added == 0
+    assert summary.probes_run == 1
+    assert summary.candidates_created == 1
+    assert {item.candidate.domain for item in store.list_review_queue()} == {"recoverable.ai"}
+
+
+def test_retries_a_ct_root_when_dns_was_not_ready_on_its_first_round(tmp_path) -> None:
+    """A real new site may gain DNS after its first certificate observation."""
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    page = CTPage(entries=(_cert("c1", "warming-up.ai"),), next_cursor="c1")
+    poller = _make_poller(store, (page,))
+    registration = Registration(
+        domain="warming-up.ai",
+        registration_date=_OBSERVED - timedelta(days=2),
+        registrar="Example Registrar",
+        statuses=(),
+    )
+    dns_attempts = 0
+
+    def delayed_dns(domains: list[str]) -> dict[str, DnsResult]:
+        nonlocal dns_attempts
+        dns_attempts += 1
+        ready = dns_attempts > 1
+        return {
+            domain: DnsResult(
+                domain=domain,
+                has_a=ready,
+                addresses=("203.0.113.10",) if ready else (),
+            )
+            for domain in domains
+        }
+
+    strict_filter = FilterPipeline(
+        cache=MemoryCache(),
+        rdap_fetcher=lambda _domain: registration,
+        dns_checker=delayed_dns,
+        require_dns=True,
+        drop_unknown_rdap=True,
+    )
+    pipeline = AIToolsHunterPipeline(
+        store=store,
+        probe=_FakeProbe({"warming-up.ai": _ai_publishable("warming-up.ai")}),
+    )  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store,
+        poller=poller,
+        pipeline=pipeline,
+        filter_pipeline=strict_filter,
+        require_first_seen=True,
+        probe_limit=1,
+    )
+
+    first = _run(orchestrator.run_once(observed_at=_OBSERVED))
+    second = _run(orchestrator.run_once(observed_at=_OBSERVED + timedelta(minutes=5)))
+
+    assert first.probes_run == 0
+    assert first.strict_rejections == 0
+    assert second.probes_run == 1
+    assert second.candidates_created == 1
+
+
+def test_strict_mode_filters_before_probe_and_marks_rejected_roots_seen(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    page = CTPage(
+        entries=(
+            _cert("c1", "azure.com"),
+            _cert("c2", "new-ai.dev"),
+        ),
+        next_cursor="c2",
+    )
+    poller = _make_poller(store, (page,))
+    probe = _FakeProbe(
+        {
+            "azure.com": _ai_publishable("azure.com"),
+            "new-ai.dev": _ai_publishable("new-ai.dev"),
+        }
+    )
+    pipeline = AIToolsHunterPipeline(store=store, probe=probe)  # type: ignore[arg-type]
+    strict_filter = _FakeFilterPipeline({"new-ai.dev"})
+    orchestrator = CTIngestOrchestrator(
+        store=store,
+        poller=poller,
+        pipeline=pipeline,
+        filter_pipeline=strict_filter,
+        require_first_seen=True,
+        probe_limit=10,
+    )
+
+    async def go() -> None:
+        summary = await orchestrator.run_once(observed_at=_OBSERVED)
+        assert summary.probes_run == 1
+        assert summary.candidates_created == 1
+
+    _run(go())
+    assert strict_filter.calls == [(("azure.com", "new-ai.dev"), _OBSERVED)]
+    assert store.is_seen("azure.com") is True
+    assert store.is_seen("new-ai.dev") is True
+    assert {item.candidate.domain for item in store.list_review_queue()} == {"new-ai.dev"}
+
+
+def test_strict_mode_never_probes_a_domain_dropped_by_rdap_age(tmp_path) -> None:
+    """A newly observed certificate cannot make an old registration a candidate."""
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    poller = _make_poller(
+        store,
+        (
+            CTPage(
+                entries=(_cert("microsoft-certificate", "azure.com"),),
+                next_cursor="microsoft-certificate",
+            ),
+        ),
+    )
+    old_registration = Registration(
+        domain="azure.com",
+        registration_date=datetime.now(UTC) - timedelta(days=365 * 20),
+        registrar="Example Registrar",
+        statuses=(),
+    )
+    strict_filter = FilterPipeline(
+        cache=MemoryCache(),
+        rdap_fetcher=lambda _domain: old_registration,
+        dns_checker=lambda domains: {
+            domain: DnsResult(domain=domain, has_a=True, addresses=("1.2.3.4",))
+            for domain in domains
+        },
+        require_dns=True,
+        drop_unknown_rdap=True,
+    )
+    pipeline = AIToolsHunterPipeline(store=store, probe=_FakeProbe({}))  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store,
+        poller=poller,
+        pipeline=pipeline,
+        filter_pipeline=strict_filter,
+        require_first_seen=True,
+        probe_limit=10,
+    )
+
+    summary = _run(orchestrator.run_once(observed_at=_OBSERVED))
+
+    assert summary.probes_run == 0
+    assert summary.candidates_created == 0
+    assert store.list_review_queue() == ()
+    assert store.is_seen("azure.com") is True
+
+
+def test_strict_mode_completes_a_terminal_rdap_rejection(tmp_path) -> None:
+    """An established domain is not retried forever after a decisive RDAP result."""
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    poller = _make_poller(
+        store,
+        (CTPage(entries=(_cert("c1", "old-domain.com"),), next_cursor="c1"),),
+    )
+    old_registration = Registration(
+        domain="old-domain.com",
+        registration_date=_OBSERVED - timedelta(days=365),
+        registrar="Example Registrar",
+        statuses=(),
+    )
+    strict_filter = FilterPipeline(
+        cache=MemoryCache(),
+        rdap_fetcher=lambda _domain: old_registration,
+        dns_checker=lambda domains: {
+            domain: DnsResult(domain=domain, has_a=True, addresses=("1.2.3.4",))
+            for domain in domains
+        },
+        require_dns=True,
+        drop_unknown_rdap=True,
+    )
+    pipeline = AIToolsHunterPipeline(store=store, probe=_FakeProbe({}))  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store,
+        poller=poller,
+        pipeline=pipeline,
+        filter_pipeline=strict_filter,
+        require_first_seen=True,
+        probe_limit=1,
+    )
+
+    first = _run(orchestrator.run_once(observed_at=_OBSERVED))
+    second = _run(orchestrator.run_once(observed_at=_OBSERVED + timedelta(minutes=5)))
+
+    assert first.strict_rejections == 1
+    assert second.strict_rejections == 0
+    assert second.probes_run == 0
+
+
+def test_strict_mode_persists_newness_and_reachability_facts(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    poller = _make_poller(
+        store,
+        (
+            CTPage(
+                entries=(_cert("c1", "new-ai.dev"),),
+                next_cursor="c1",
+            ),
+        ),
+    )
+    registration = Registration(
+        domain="new-ai.dev",
+        registration_date=_OBSERVED - timedelta(days=5),
+        registrar="Example Registrar",
+        statuses=(),
+    )
+    strict_filter = FilterPipeline(
+        cache=MemoryCache(),
+        rdap_fetcher=lambda _domain: registration,
+        dns_checker=lambda domains: {
+            domain: DnsResult(
+                domain=domain,
+                has_a=True,
+                addresses=("203.0.113.10",),
+            )
+            for domain in domains
+        },
+        require_dns=True,
+        drop_unknown_rdap=True,
+    )
+    pipeline = AIToolsHunterPipeline(
+        store=store,
+        probe=_FakeProbe({"new-ai.dev": _ai_publishable("new-ai.dev")}),
+    )  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store,
+        poller=poller,
+        pipeline=pipeline,
+        filter_pipeline=strict_filter,
+        require_first_seen=True,
+        probe_limit=10,
+    )
+
+    summary = _run(orchestrator.run_once(observed_at=_OBSERVED))
+
+    assert summary.roots_observed == 1
+    assert summary.strict_rejections == 0
+    item = store.list_review_queue()[0]
+    verification = store.get_candidate_verification(
+        item.candidate.candidate_id, item.latest_version.version
+    )
+    assert verification is not None
+    assert verification.ct_first_seen_at == _OBSERVED
+    assert verification.rdap_tier == "tier1"
+    assert verification.rdap_age_days == 5
+    assert verification.dns_has_a is True
+    assert verification.http_status_code == 200
+    assert verification.final_root_matches is True
+
+
+def test_strict_mode_preserves_s5_enrichment_and_its_verification(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    poller = _make_poller(
+        store,
+        (
+            CTPage(
+                entries=(_cert("c1", "new-ai.dev"),),
+                next_cursor="c1",
+            ),
+        ),
+    )
+    registration = Registration(
+        domain="new-ai.dev",
+        registration_date=_OBSERVED - timedelta(days=5),
+        registrar="Example Registrar",
+        statuses=(),
+    )
+    strict_filter = FilterPipeline(
+        cache=MemoryCache(),
+        rdap_fetcher=lambda _domain: registration,
+        dns_checker=lambda domains: {
+            domain: DnsResult(
+                domain=domain,
+                has_a=True,
+                addresses=("203.0.113.10",),
+            )
+            for domain in domains
+        },
+        require_dns=True,
+        drop_unknown_rdap=True,
+    )
+    pipeline = AIToolsHunterPipeline(
+        store=store,
+        probe=_FakeProbe({"new-ai.dev": _ai_publishable("new-ai.dev")}),
+    )  # type: ignore[arg-type]
+    llm_draft = CandidateVersionDraft(
+        author_kind="llm",
+        primary_outcome=CandidateOutcome.PUBLISHABLE_AI_SAAS,
+        classification_confidence=0.94,
+        name_suggestion="New AI",
+        description_suggestion="A newly discovered AI service.",
+        category="automation",
+        tags=("ai",),
+        pricing_model=None,
+        target_audience=None,
+        evidence=(
+            Evidence(
+                EvidenceType.H1,
+                "AI assistant platform with free trial pricing.",
+                "https://new-ai.dev",
+            ),
+        ),
+        model_version="mock-1",
+    )
+    orchestrator = CTIngestOrchestrator(
+        store=store,
+        poller=poller,
+        pipeline=pipeline,
+        filter_pipeline=strict_filter,
+        require_first_seen=True,
+        probe_limit=10,
+        provider=MockLLMProvider(draft=llm_draft),
+    )
+
+    summary = _run(orchestrator.run_once(observed_at=_OBSERVED))
+
+    assert summary.candidates_created == 1
+    assert summary.llm_enriched == 1
+    item = store.list_review_queue()[0]
+    assert item.latest_version is not None
+    assert item.latest_version.draft.author_kind == "llm"
+    verification = store.get_candidate_verification(
+        item.candidate.candidate_id, item.latest_version.version
+    )
+    assert verification is not None
+    assert verification.rdap_tier == "tier1"
+    assert verification.final_root_matches is True
+
+
+def test_strict_mode_rejects_cross_root_redirect_candidate(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    poller = _make_poller(
+        store,
+        (
+            CTPage(
+                entries=(_cert("c1", "fresh-redirect.com"),),
+                next_cursor="c1",
+            ),
+        ),
+    )
+    probe = _FakeProbe(
+        {"fresh-redirect.com": _redirected_ai_publishable("old-site.com")}
+    )
+    pipeline = AIToolsHunterPipeline(store=store, probe=probe)  # type: ignore[arg-type]
+    strict_filter = _FakeFilterPipeline({"fresh-redirect.com"})
+    orchestrator = CTIngestOrchestrator(
+        store=store,
+        poller=poller,
+        pipeline=pipeline,
+        filter_pipeline=strict_filter,
+        require_first_seen=True,
+        probe_limit=10,
+    )
+
+    summary = _run(orchestrator.run_once(observed_at=_OBSERVED))
+
+    assert summary.probes_run == 1
+    assert summary.candidates_created == 0
+    assert store.list_observations("fresh-redirect.com")[0].final_url == "https://old-site.com"
+    assert store.list_review_queue() == ()
+
+
+def test_idempotent_on_replay(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    page = CTPage(
+        entries=(_cert("c1", "nova-ai.com"),),
+        next_cursor="c1",
+    )
+    poller = _make_poller(store, (page, page))
+    probe = _FakeProbe({"nova-ai.com": _ai_publishable("nova-ai.com")})
+    pipeline = AIToolsHunterPipeline(store=store, probe=probe)  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store, poller=poller, pipeline=pipeline, probe_limit=10
+    )
+
+    async def go() -> None:
+        first = await orchestrator.run_once(observed_at=_OBSERVED)
+        replay = await orchestrator.run_once(observed_at=_OBSERVED)
+        assert first.candidates_created == 1
+        assert first.probes_run == 1
+        assert replay.certificates_seen == 1
+        assert replay.events_added == 0
+        assert replay.probes_run == 0
+        assert replay.candidates_created == 0
+
+    _run(go())
+
+
+def test_skips_domains_with_no_candidate(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    page = CTPage(
+        entries=(
+            _cert("c1", "with-content.com"),
+            _cert("c2", "no-content.com"),
+        ),
+        next_cursor="c2",
+    )
+    poller = _make_poller(store, (page,))
+    probe = _FakeProbe(
+        {
+            "with-content.com": _ai_publishable("with-content.com"),
+            "no-content.com": _empty_success("no-content.com"),
+        }
+    )
+    pipeline = AIToolsHunterPipeline(store=store, probe=probe)  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store, poller=poller, pipeline=pipeline, probe_limit=10
+    )
+
+    async def go() -> None:
+        summary = await orchestrator.run_once(observed_at=_OBSERVED)
+        assert summary.probes_run == 2
+        assert summary.candidates_created == 1
+
+    _run(go())
+
+
+def test_empty_page_returns_zero_summary(tmp_path) -> None:
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    poller = _make_poller(store, (CTPage(entries=(), next_cursor=None),))
+    probe = _FakeProbe({})
+    pipeline = AIToolsHunterPipeline(store=store, probe=probe)  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store, poller=poller, pipeline=pipeline, probe_limit=10
+    )
+
+    async def go() -> None:
+        summary = await orchestrator.run_once(observed_at=_OBSERVED)
+        assert summary.certificates_seen == 0
+        assert summary.events_added == 0
+        assert summary.probes_run == 0
+        assert summary.candidates_created == 0
+
+    _run(go())
+
+
+class _SelectiveFailingProbe:
+    """Raises for configured hostnames; canned analyses for the rest."""
+
+    def __init__(self, responses: dict[str, L1Analysis], failing: set[str]) -> None:
+        self._responses = responses
+        self._failing = failing
+
+    async def probe(self, hostname: str) -> ProbeResult:
+        if hostname in self._failing:
+            raise RuntimeError(f"boom for {hostname}")
+        analysis = self._responses.get(hostname)
+        if analysis is None:
+            return ProbeResult(
+                outcome_code=OutcomeCode.DNS_NOT_FOUND,
+                final_url=None,
+                analysis=None,
+                detail="no canned response",
+            )
+        return ProbeResult(
+            outcome_code=analysis.outcome_code,
+            final_url=analysis.final_url,
+            analysis=analysis,
+        )
+
+
+def test_probe_concurrency_isolates_failures(tmp_path) -> None:
+    """Parallel probing must not abort the round when one site explodes."""
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    hosts = ("alpha-ai.com", "beta-ai.com", "gamma-ai.com", "delta-ai.com", "boom-ai.com")
+    page = CTPage(
+        entries=tuple(_cert(f"c{i}", host) for i, host in enumerate(hosts)),
+        next_cursor="done",
+    )
+    poller = _make_poller(store, (page,))
+    responses = {
+        "alpha-ai.com": _ai_publishable("alpha-ai.com"),
+        "beta-ai.com": _ai_publishable("beta-ai.com"),
+        "gamma-ai.com": _empty_success("gamma-ai.com"),
+        "delta-ai.com": _ai_publishable("delta-ai.com"),
+    }
+    probe = _SelectiveFailingProbe(responses, failing={"boom-ai.com"})
+    pipeline = AIToolsHunterPipeline(store=store, probe=probe)  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store,
+        poller=poller,
+        pipeline=pipeline,
+        probe_limit=10,
+        probe_concurrency=4,
+    )
+
+    async def go() -> CTIngestRunSummary:
+        return await orchestrator.run_once(observed_at=_OBSERVED)
+
+    summary = _run(go())
+    assert summary.probes_run == 4  # the exploding one never produced a run
+    assert summary.candidates_created == 3
+    assert summary.pending_work == 1  # boom-ai.com was retried, still pending
+    queue_domains = {item.candidate.domain for item in store.list_review_queue()}
+    assert queue_domains == {"alpha-ai.com", "beta-ai.com", "delta-ai.com"}
+
+
+def test_digest_only_round_processes_work_without_polling(tmp_path) -> None:
+    """`run_once(poll=False)` must not touch the CT cursor or poller."""
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    store.append_source_event(
+        SourceEvent("ct_log", "x:1", "quiet-ai.com", _OBSERVED),
+        hostname="quiet-ai.com",
+    )
+
+    async def exploding_fetch(_cursor: str | None) -> CTPage:
+        raise AssertionError("poll=False must never call the poller")
+
+    poller = CTPoller(store=store, fetch_page=exploding_fetch)
+    probe = _FakeProbe({"quiet-ai.com": _ai_publishable("quiet-ai.com")})
+    pipeline = AIToolsHunterPipeline(store=store, probe=probe)  # type: ignore[arg-type]
+    orchestrator = CTIngestOrchestrator(
+        store=store, poller=poller, pipeline=pipeline, probe_limit=10
+    )
+
+    async def digest() -> CTIngestRunSummary:
+        return await orchestrator.run_once(observed_at=_OBSERVED, poll=False)
+
+    summary = _run(digest())
+    assert summary.certificates_seen == 0
+    assert summary.probes_run == 1
+    assert summary.candidates_created == 1
+
+
+@dataclass(frozen=True, slots=True)
+class _StubFilter:
+    """A funnel that rejects every domain with a canned decision.
+
+    Lets the retry-scheduling tests state the rejection they care about
+    (``rdap_unavailable`` with a failure count, ``dns_not_ready``, …) without
+    standing up RDAP and DNS fakes.
+    """
+
+    decisions: Mapping[str, FilterDecision]
+
+    def evaluate(self, domains, *, observed_at=None):
+        return tuple(
+            self.decisions.get(
+                domain,
+                FilterDecision(
+                    domain=domain, candidate=None, retryable=False, reason="not_a_candidate"
+                ),
+            )
+            for domain in domains
+        )
+
+
+def _next_attempt_at(store: SQLiteStore, domain: str) -> datetime:
+    with store._connection() as connection:
+        row = connection.execute(
+            "SELECT next_attempt_at FROM ct_discovery_work WHERE domain = ?", (domain,)
+        ).fetchone()
+    assert row is not None, f"{domain} is not in the work queue"
+    return datetime.fromisoformat(row["next_attempt_at"])
+
+
+def _retry_delay_used(
+    tmp_path, *, reason: str, rdap_attempts: int = 0
+) -> timedelta:
+    """Run one round that rejects ``down-ai.com`` and return the delay scheduled."""
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    store.append_source_event(
+        SourceEvent("ct_log", "x:1", "down-ai.com", _OBSERVED), hostname="down-ai.com"
+    )
+    orchestrator = CTIngestOrchestrator(
+        store=store,
+        poller=_make_poller(store, ()),
+        pipeline=AIToolsHunterPipeline(store=store, probe=_FakeProbe({})),  # type: ignore[arg-type]
+        filter_pipeline=_StubFilter(
+            {
+                "down-ai.com": FilterDecision(
+                    domain="down-ai.com",
+                    candidate=None,
+                    retryable=True,
+                    reason=reason,
+                    rdap_attempts=rdap_attempts,
+                )
+            }
+        ),
+        probe_limit=10,
+        filter_retry_delay=timedelta(seconds=20),
+    )
+
+    _run(orchestrator.run_once(observed_at=_OBSERVED))
+    return _next_attempt_at(store, "down-ai.com") - _OBSERVED
+
+
+def test_an_rdap_outage_backs_off_on_the_network_schedule(tmp_path) -> None:
+    """A flat re-queue of every retryable rejection is what started the livelock.
+
+    ``--follow`` passes ``filter_retry_delay=20s``, so an RDAP-unavailable
+    domain used to come back every 20 seconds forever. It now follows the shared
+    1h/6h/24h/72h network schedule.
+    """
+    assert _retry_delay_used(tmp_path, reason="rdap_unavailable", rdap_attempts=1) == (
+        timedelta(hours=1)
+    )
+
+
+def test_a_dns_readiness_rejection_keeps_the_flat_delay(tmp_path) -> None:
+    """DNS readiness is a cheap local check — it does not need network backoff."""
+    assert _retry_delay_used(tmp_path, reason="dns_not_ready") == timedelta(seconds=20)
+
+
+@pytest.mark.parametrize(
+    ("attempts", "expected"),
+    [
+        (1, timedelta(hours=1)),
+        (2, timedelta(hours=6)),
+        (3, timedelta(hours=24)),
+        (4, timedelta(hours=72)),
+        (5, timedelta(hours=72)),
+        (99, timedelta(hours=72)),
+    ],
+)
+def test_rdap_retries_climb_the_schedule_and_never_give_up(
+    tmp_path, attempts: int, expected: timedelta
+) -> None:
+    """The schedule slows down but never discards.
+
+    docs/filter-layer-plan.md makes "never permanently discard an unavailable
+    RDAP domain" a settled decision, so an exhausted schedule stays on its
+    longest tier instead of completing the work item.
+    """
+    assert _retry_delay_used(tmp_path, reason="rdap_unavailable", rdap_attempts=attempts) == expected
+
+
+def test_an_rdap_outage_keeps_the_domain_in_the_queue(tmp_path) -> None:
+    """The work item must stay pending, not be completed away."""
+    store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+    store.append_source_event(
+        SourceEvent("ct_log", "x:1", "down-ai.com", _OBSERVED), hostname="down-ai.com"
+    )
+    orchestrator = CTIngestOrchestrator(
+        store=store,
+        poller=_make_poller(store, ()),
+        pipeline=AIToolsHunterPipeline(store=store, probe=_FakeProbe({})),  # type: ignore[arg-type]
+        filter_pipeline=_StubFilter(
+            {
+                "down-ai.com": FilterDecision(
+                    domain="down-ai.com",
+                    candidate=None,
+                    retryable=True,
+                    reason="rdap_unavailable",
+                    rdap_attempts=99,
+                )
+            }
+        ),
+        probe_limit=10,
+    )
+
+    summary = _run(orchestrator.run_once(observed_at=_OBSERVED))
+
+    assert summary.pending_work == 1, "an RDAP outage must not complete the work item"
+    assert store.list_pending_ct_discovery_domains(limit=10) == ("down-ai.com",)
