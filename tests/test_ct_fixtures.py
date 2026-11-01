@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from ai_tools_hunter.ingest.ct_events import build_ct_events, extract_certificate_hostnames
-from ai_tools_hunter.ingest.ct_poller import CTCertificate, CTPage, CTPoller
-from ai_tools_hunter.storage.sqlite import SQLiteStore
+from ai_tools_before_launch.ingest.ct_events import build_ct_events, extract_certificate_hostnames
+from ai_tools_before_launch.ingest.ct_poller import CTCertificate, CTPage, CTPoller
+from ai_tools_before_launch.storage.sqlite import SQLiteStore
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "ct"
@@ -38,7 +38,7 @@ def test_renewal_fixture_appends_once_and_replay_is_noop(tmp_path) -> None:
     fixture = _load("renewal.json")
 
     async def run() -> None:
-        store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+        store = SQLiteStore(tmp_path / "ai_tools_before_launch.db")
         poller = CTPoller(store=store, fetch_page=lambda cursor: _page_async(_make_entries(fixture), None))
 
         first = await poller.poll()
@@ -69,7 +69,7 @@ def test_wildcard_fixture_records_the_root_once_for_every_hostname(tmp_path) -> 
     fixture = _load("wildcard.json")
 
     async def run() -> None:
-        store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+        store = SQLiteStore(tmp_path / "ai_tools_before_launch.db")
         poller = CTPoller(store=store, fetch_page=lambda cursor: _page_async(_make_entries(fixture), None))
         result = await poller.poll()
 
@@ -85,7 +85,7 @@ def test_duplicate_fixture_is_idempotent_across_replays(tmp_path) -> None:
     fixture = _load("duplicate.json")
 
     async def run() -> None:
-        store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+        store = SQLiteStore(tmp_path / "ai_tools_before_launch.db")
         poller = CTPoller(store=store, fetch_page=lambda cursor: _page_async(_make_entries(fixture), None))
 
         first = await poller.poll()
@@ -112,7 +112,7 @@ def test_malformed_fixture_skips_bad_entries_without_crashing(tmp_path) -> None:
     fixture = _load("malformed.json")
 
     async def run() -> None:
-        store = SQLiteStore(tmp_path / "ai_tools_hunter.db")
+        store = SQLiteStore(tmp_path / "ai_tools_before_launch.db")
         events_seen = 0
         for entry in fixture["entries"]:
             if not entry["source_event_id"]:

@@ -11,7 +11,7 @@ export type Language = "zh" | "en";
 export type Theme = "light" | "dark";
 
 const zh = {
-  product: "AI-Tools-Hunter",
+  product: "ai-tools-before-launch",
   tagline: "早期 AI 工具信号台",
   skipToContent: "跳到主内容",
 
@@ -253,7 +253,7 @@ const zh = {
 };
 
 const en: typeof zh = {
-  product: "AI-Tools-Hunter",
+  product: "ai-tools-before-launch",
   tagline: "Early AI-tool signal desk",
   skipToContent: "Skip to content",
 

@@ -1,7 +1,7 @@
 /**
- * Wire types for the AI-Tools-Hunter review API.
+ * Wire types for the ai-tools-before-launch review API.
  *
- * These mirror `ai_tools_hunter.api.dependencies.review_projection` exactly — no
+ * These mirror `ai_tools_before_launch.api.dependencies.review_projection` exactly — no
  * flattening, no invented fields. Everything the console renders is a fact the
  * backend already persisted.
  */
@@ -11,7 +11,7 @@ export type EvidenceStatus = "passed" | "failed" | "unknown";
 export type ReviewAction = "approve" | "defer" | "reject" | "blocklist";
 export type ActorKind = "rule" | "llm" | "human";
 
-/** S1–S5 outcome vocabulary (`ai_tools_hunter.domain.candidates.CandidateOutcome`). */
+/** S1–S5 outcome vocabulary (`ai_tools_before_launch.domain.candidates.CandidateOutcome`). */
 export type CandidateOutcome =
   | "publishable_ai_saas"
   | "valid_but_not_ready"

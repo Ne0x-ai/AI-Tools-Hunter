@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from ai_tools_hunter.domain.events import SourceEvent
+from ai_tools_before_launch.domain.events import SourceEvent
 
 
 def test_same_source_and_event_id_have_same_idempotency_key() -> None:

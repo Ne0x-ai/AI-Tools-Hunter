@@ -2,18 +2,18 @@ from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
-from ai_tools_hunter.api import create_app
-from ai_tools_hunter.domain.candidates import (
+from ai_tools_before_launch.api import create_app
+from ai_tools_before_launch.domain.candidates import (
     CandidateOutcome,
     CandidateVersionDraft,
     Evidence,
     EvidenceType,
 )
-from ai_tools_hunter.domain.review_priority import (
+from ai_tools_before_launch.domain.review_priority import (
     ReviewPriorityInputs,
     calculate_review_priority,
 )
-from ai_tools_hunter.storage.sqlite import SQLiteStore
+from ai_tools_before_launch.storage.sqlite import SQLiteStore
 
 
 NOW = datetime(2026, 9, 3, tzinfo=UTC)

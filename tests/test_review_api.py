@@ -2,18 +2,18 @@ from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
-from ai_tools_hunter.api import create_app
-from ai_tools_hunter.domain.candidates import (
+from ai_tools_before_launch.api import create_app
+from ai_tools_before_launch.domain.candidates import (
     CandidateOutcome,
     CandidateVersionDraft,
     Evidence,
     EvidenceType,
 )
-from ai_tools_hunter.domain.events import SourceEvent
-from ai_tools_hunter.domain.observations import Observation, OutcomeCode
-from ai_tools_hunter.domain.reviews import ReasonTag
-from ai_tools_hunter.domain.review_priority import ReviewPriorityInputs, calculate_review_priority
-from ai_tools_hunter.storage.sqlite import SQLiteStore
+from ai_tools_before_launch.domain.events import SourceEvent
+from ai_tools_before_launch.domain.observations import Observation, OutcomeCode
+from ai_tools_before_launch.domain.reviews import ReasonTag
+from ai_tools_before_launch.domain.review_priority import ReviewPriorityInputs, calculate_review_priority
+from ai_tools_before_launch.storage.sqlite import SQLiteStore
 
 
 OBSERVED_AT = datetime(2026, 8, 16, tzinfo=UTC)
@@ -42,7 +42,7 @@ def _reviewable_candidate(store: SQLiteStore):
 
 
 def test_lists_a_reviewable_candidate_with_its_evidence_and_score(tmp_path) -> None:
-    database = tmp_path / "ai_tools_hunter.db"
+    database = tmp_path / "ai_tools_before_launch.db"
     store = SQLiteStore(database)
     candidate, version = _reviewable_candidate(store)
 
@@ -57,7 +57,7 @@ def test_lists_a_reviewable_candidate_with_its_evidence_and_score(tmp_path) -> N
 
 
 def test_review_queue_projects_canonical_and_internal_links_when_present(tmp_path) -> None:
-    database = tmp_path / "ai_tools_hunter.db"
+    database = tmp_path / "ai_tools_before_launch.db"
     store = SQLiteStore(database)
     candidate, _version = _reviewable_candidate(store)
     event = SourceEvent("ct_log", "argon:43", "example.com", OBSERVED_AT)
@@ -87,7 +87,7 @@ def test_review_queue_projects_canonical_and_internal_links_when_present(tmp_pat
 
 
 def test_review_queue_omits_canonical_and_internal_links_when_absent(tmp_path) -> None:
-    database = tmp_path / "ai_tools_hunter.db"
+    database = tmp_path / "ai_tools_before_launch.db"
     _reviewable_candidate(SQLiteStore(database))
 
     response = TestClient(create_app(database)).get("/v1/review-queue")
@@ -99,7 +99,7 @@ def test_review_queue_omits_canonical_and_internal_links_when_absent(tmp_path) -
 
 
 def test_appends_idempotent_review_decisions_with_an_explicit_actor(tmp_path) -> None:
-    database = tmp_path / "ai_tools_hunter.db"
+    database = tmp_path / "ai_tools_before_launch.db"
     store = SQLiteStore(database)
     candidate, version = _reviewable_candidate(store)
     client = TestClient(create_app(database))
@@ -128,7 +128,7 @@ def test_appends_idempotent_review_decisions_with_an_explicit_actor(tmp_path) ->
 
 
 def test_detail_page_is_independent_and_evidence_led(tmp_path) -> None:
-    database = tmp_path / "ai_tools_hunter.db"
+    database = tmp_path / "ai_tools_before_launch.db"
     store = SQLiteStore(database)
     candidate, _version = _reviewable_candidate(store)
 
@@ -140,7 +140,7 @@ def test_detail_page_is_independent_and_evidence_led(tmp_path) -> None:
 
 
 def test_appends_decision_with_known_reason_tag_values(tmp_path) -> None:
-    database = tmp_path / "ai_tools_hunter.db"
+    database = tmp_path / "ai_tools_before_launch.db"
     store = SQLiteStore(database)
     candidate, version = _reviewable_candidate(store)
     client = TestClient(create_app(database))
@@ -161,7 +161,7 @@ def test_appends_decision_with_known_reason_tag_values(tmp_path) -> None:
 
 
 def test_rejects_decision_with_unknown_reason_tag_value(tmp_path) -> None:
-    database = tmp_path / "ai_tools_hunter.db"
+    database = tmp_path / "ai_tools_before_launch.db"
     candidate, version = _reviewable_candidate(SQLiteStore(database))
     client = TestClient(create_app(database))
 

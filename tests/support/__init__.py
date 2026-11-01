@@ -1,1 +1,1 @@
-"""Test support package for AI-Tools-Hunter."""
+"""Test support package for ai-tools-before-launch."""

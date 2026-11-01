@@ -2,7 +2,7 @@ import socket
 
 import pytest
 
-from ai_tools_hunter.network_safety import (
+from ai_tools_before_launch.network_safety import (
     BlockedNetworkTarget,
     resolve_public_addresses,
     validate_public_addresses,

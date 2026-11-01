@@ -1,4 +1,4 @@
-"""Shared fixtures for the AI-Tools-Hunter test suite.
+"""Shared fixtures for the ai-tools-before-launch test suite.
 
 Two constraints of the sandbox this suite is sometimes run in shape this file:
 

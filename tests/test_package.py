@@ -1,4 +1,4 @@
-from ai_tools_hunter import __version__
+from ai_tools_before_launch import __version__
 
 
 def test_package_exposes_initial_version() -> None:

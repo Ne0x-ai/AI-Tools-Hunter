@@ -1,6 +1,6 @@
 """Tests for S1 static domain signals."""
 
-from ai_tools_hunter.filter.static_signals import (
+from ai_tools_before_launch.filter.static_signals import (
     batch_registration_flag,
     compute_signals,
     score_domain,

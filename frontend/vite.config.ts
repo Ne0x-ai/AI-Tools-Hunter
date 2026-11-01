@@ -4,7 +4,7 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   build: {
-    outDir: "../src/ai_tools_hunter/static",
+    outDir: "../src/ai_tools_before_launch/static",
     emptyOutDir: true,
   },
 });

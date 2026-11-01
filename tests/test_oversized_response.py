@@ -13,8 +13,8 @@ import asyncio
 import httpx
 import pytest
 
-from ai_tools_hunter.crawler.http_probe import HTTPProbe
-from ai_tools_hunter.domain.observations import OutcomeCode
+from ai_tools_before_launch.crawler.http_probe import HTTPProbe
+from ai_tools_before_launch.domain.observations import OutcomeCode
 
 from tests.support.fake_http import FakeHTTPServer
 

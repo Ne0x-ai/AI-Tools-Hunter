@@ -1,6 +1,10 @@
 [project]
-name = "ai-tools-hunter"
+name = "ai-tools-before-launch"
 version = "0.1.0"
+description = "Find new AI tools before anyone else — by watching Certificate Transparency logs"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Neo Xue" }]
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28",
@@ -11,10 +15,14 @@ dependencies = [
 ]
 
 [project.scripts]
-ai-tools-hunter = "ai_tools_hunter.cli:main"
+ai-tools-before-launch = "ai_tools_before_launch.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=9.0"]
+
+[project.urls]
+Homepage = "https://github.com/Ne0x-ai/ai-tools-before-launch"
+Repository = "https://github.com/Ne0x-ai/ai-tools-before-launch"
 
 [build-system]
 requires = ["setuptools>=68"]

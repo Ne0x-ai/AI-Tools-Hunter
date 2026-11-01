@@ -2,8 +2,8 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "AI-Tools-Hunter Architecture",
-    "output": "ai-tools-hunter-architecture.html",
+    "title": "ai-tools-before-launch Architecture",
+    "output": "ai-tools-before-launch-architecture.html",
     "quality_profile": "showcase",
     "animation": "trace",
     "visual_preset": "signal-flow"

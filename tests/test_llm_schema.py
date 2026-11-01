@@ -1,7 +1,7 @@
 import json
 
-from ai_tools_hunter.domain.candidates import CandidateOutcome, Evidence, EvidenceType
-from ai_tools_hunter.llm.schema import LLMResultState, parse_llm_candidate_output
+from ai_tools_before_launch.domain.candidates import CandidateOutcome, Evidence, EvidenceType
+from ai_tools_before_launch.llm.schema import LLMResultState, parse_llm_candidate_output
 
 
 EVIDENCE = (

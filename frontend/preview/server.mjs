@@ -1,7 +1,7 @@
 /**
  * Design preview server — NOT part of the shipped console.
  *
- * Serves the built bundle from `src/ai_tools_hunter/static` and answers the four
+ * Serves the built bundle from `src/ai_tools_before_launch/static` and answers the four
  * read endpoints with fixed fixtures, so the interface can be reviewed without
  * running the Python daemon or a real CT scan. Mutations are accepted and
  * acknowledged but never persisted.
@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 
 const FRONTEND = normalize(join(fileURLToPath(new URL(".", import.meta.url)), ".."));
 // Vite writes the bundle to the package's static dir, one level above `frontend/`.
-const STATIC = normalize(join(FRONTEND, "..", "src", "ai_tools_hunter", "static"));
+const STATIC = normalize(join(FRONTEND, "..", "src", "ai_tools_before_launch", "static"));
 const PORT = Number(process.env.PORT ?? 4173);
 /** Rehearse the first-run state: no candidates, no cursor, empty queue. */
 const EMPTY = process.env.DH_EMPTY === "1";
@@ -250,13 +250,13 @@ const COUNTS = {
 };
 
 const LOG_LINES = [
-  "2026-10-14 10:41:02 INFO ai_tools_hunter.ingest.runner sweep start cursor=8412993144",
-  "2026-10-14 10:41:03 INFO ai_tools_hunter.ingest.ct_log_adapter page entries=500 log=nimbus2026",
-  "2026-10-14 10:41:07 INFO ai_tools_hunter.filter.pipeline strict reject=418 tier=stale",
-  "2026-10-14 10:41:07 INFO ai_tools_hunter.filter.pipeline dns pass=31 fail=12",
-  "2026-10-14 10:41:12 INFO ai_tools_hunter.crawler.http_probe probe=16 ok=9 status_4xx=3 timeout=4",
-  "2026-10-14 10:41:14 INFO ai_tools_hunter.pipeline candidates_created=2",
-  "2026-10-14 10:41:15 INFO ai_tools_hunter.ingest.runner sweep done next_cursor=8412993871 idle=15s",
+  "2026-10-14 10:41:02 INFO ai_tools_before_launch.ingest.runner sweep start cursor=8412993144",
+  "2026-10-14 10:41:03 INFO ai_tools_before_launch.ingest.ct_log_adapter page entries=500 log=nimbus2026",
+  "2026-10-14 10:41:07 INFO ai_tools_before_launch.filter.pipeline strict reject=418 tier=stale",
+  "2026-10-14 10:41:07 INFO ai_tools_before_launch.filter.pipeline dns pass=31 fail=12",
+  "2026-10-14 10:41:12 INFO ai_tools_before_launch.crawler.http_probe probe=16 ok=9 status_4xx=3 timeout=4",
+  "2026-10-14 10:41:14 INFO ai_tools_before_launch.pipeline candidates_created=2",
+  "2026-10-14 10:41:15 INFO ai_tools_before_launch.ingest.runner sweep done next_cursor=8412993871 idle=15s",
 ];
 
 const MIME = {
@@ -376,5 +376,5 @@ const server = createServer(async (request, response) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`AI-Tools-Hunter design preview → http://127.0.0.1:${PORT}`);
+  console.log(`ai-tools-before-launch design preview → http://127.0.0.1:${PORT}`);
 });
