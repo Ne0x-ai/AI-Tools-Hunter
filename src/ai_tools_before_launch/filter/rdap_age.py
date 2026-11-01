@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
+from ai_tools_before_launch.filter.rdap_bootstrap import bootstrap_map
+
 # Verisign RDAP serves these TLDs.
 _VERISIGN_TLDS = frozenset(
     {"com", "net", "org", "tv", "cc", "name", "biz", "info"}
@@ -169,9 +171,22 @@ class MemoryCache:
 
 
 def rdap_base(tld: str) -> str | None:
-    if tld in _VERISIGN_TLDS:
-        return f"https://rdap.verisign.com/{tld}/v1/domain/"
-    return _TLD_RDAP.get(tld)
+    """Resolve a TLD's RDAP base URL, or ``None`` when the registry has none.
+
+    The curated table wins where it exists (it carries corrections the IANA
+    bootstrap cannot: ``.io`` is absent there, and Verisign splits per TLD).
+    Everything else falls back to the bundled bootstrap snapshot, so a TLD is
+    only reported unsupported when *IANA* has no RDAP service for it — the
+    difference between "we forgot to add it" and "it genuinely does not
+    exist", which the age gate treats as permanent.
+    """
+    key = tld.lower()
+    if key in _VERISIGN_TLDS:
+        return f"https://rdap.verisign.com/{key}/v1/domain/"
+    curated = _TLD_RDAP.get(key)
+    if curated is not None:
+        return curated
+    return bootstrap_map().get(key)
 
 
 def _find_registrar(entities: list[dict]) -> str:

@@ -28,6 +28,15 @@ Repository = "https://github.com/Ne0x-ai/ai-tools-before-launch"
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+# Generated data and built frontend assets, not code: a wheel that omits them
+# installs cleanly and then fails at runtime. The RDAP table gates domain age,
+# and ``create_app`` mounts ``static/assets`` with ``StaticFiles``, which raises
+# ``RuntimeError`` when the directory is missing — so a .py-only wheel made
+# ``serve`` crash on startup while ``start`` kept working.
+[tool.setuptools.package-data]
+"ai_tools_before_launch.filter" = ["rdap_bootstrap.json"]
+"ai_tools_before_launch" = ["static/index.html", "static/assets/*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
 testpaths = ["tests"]

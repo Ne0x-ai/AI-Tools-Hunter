@@ -159,6 +159,7 @@ class FilterPipeline:
         tier2_days: int = 90,
         require_dns: bool = False,
         drop_unknown_rdap: bool = False,
+        min_name_score: float = 0.0,
         rdap_fetcher=None,
         dns_checker=None,
         probe: ProbeCallable | None = None,
@@ -167,6 +168,9 @@ class FilterPipeline:
     ) -> None:
         if rdap_concurrency < 1 or dns_concurrency < 1:
             raise ValueError("RDAP/DNS concurrency must be positive")
+        if not 0.0 <= min_name_score <= 1.0:
+            raise ValueError("min_name_score must be between 0 and 1")
+        self._min_name_score = min_name_score
         self._cache = cache or MemoryCache()
         self._tier1_days = tier1_days
         self._tier2_days = tier2_days
@@ -193,9 +197,25 @@ class FilterPipeline:
     ) -> tuple[FilterDecision, ...]:
         """Classify every input and identify which strict rejections may recover."""
         observed_at = observed_at or datetime.now(UTC)
+        incoming = list(domains)
         s1_results: dict[str, DomainScore] = {
             domain: score_domain(domain) for domain in domains
         }
+        # S1 is free and runs first, so it is the only stage that can save the
+        # RDAP quota below it. The threshold defaults to 0 (off) because this
+        # tool's promise is recall: a brand-new product on `wasyal.tech` is
+        # still a product. Raise it to trade recall for a smaller queue.
+        below_name_score = (
+            {
+                domain
+                for domain, score in s1_results.items()
+                if score.score < self._min_name_score
+            }
+            if self._min_name_score > 0
+            else set()
+        )
+        if below_name_score:
+            domains = [domain for domain in domains if domain not in below_name_score]
 
         # S2: RDAP age — only domains we haven't already classified this run.
         age_verdicts: dict[str, AgeVerdict] = {}
@@ -337,6 +357,21 @@ class FilterPipeline:
                 )
             )
 
+        if below_name_score:
+            # The contract is one decision per input, in input order: the
+            # orchestrator settles exactly the work items it claimed. Put the
+            # S1 rejections back where they came from.
+            by_domain = {decision.domain: decision for decision in decisions}
+            decisions = [
+                by_domain.get(domain)
+                or FilterDecision(
+                    domain=domain,
+                    candidate=None,
+                    retryable=False,
+                    reason="name_score_low",
+                )
+                for domain in incoming
+            ]
         return tuple(decisions)
 
     async def run_with_probe(

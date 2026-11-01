@@ -169,3 +169,47 @@ def test_miss_ttl_can_be_disabled() -> None:
 def test_miss_ttl_must_be_positive() -> None:
     with pytest.raises(ValueError, match="miss_ttl must be positive or None"):
         MemoryCache(miss_ttl=timedelta(0))
+
+def test_rdap_base_falls_back_to_the_iana_snapshot() -> None:
+    """TLDs outside the curated table used to be reported unsupported.
+
+    ``rdap_unsupported`` is terminal in the strict funnel, so every domain on
+    ``.tech`` / ``.tools`` / ``.studio`` / ``.design`` was silently dropped
+    before it could ever be DNS-checked or probed — where small AI products
+    actually live.
+    """
+    assert rdap_base("tech") == "https://rdap.radix.host/rdap/domain/"
+    assert rdap_base("studio") == "https://rdap.identitydigital.services/rdap/domain/"
+    assert rdap_base("design") == "https://rdap.nic.design/domain/"
+
+
+def test_curated_table_wins_over_the_snapshot() -> None:
+    """Manual corrections must survive a snapshot refresh: .io is not in IANA."""
+    from ai_tools_before_launch.filter.rdap_bootstrap import bootstrap_map
+
+    assert "io" not in bootstrap_map(), "the test is pointless if IANA lists .io"
+    assert rdap_base("io") == "https://rdap.identitydigital.services/domain/"
+    # .ai *is* in both, with different URLs: the curated one is authoritative.
+    assert rdap_base("ai") == "https://rdap.nic.ai/domain/"
+
+
+def test_rdap_base_none_means_iana_has_no_rdap_service() -> None:
+    from ai_tools_before_launch.filter.rdap_bootstrap import bootstrap_map
+
+    assert "cn" not in bootstrap_map()
+    assert rdap_base("cn") is None
+    assert rdap_base("zzzz") is None
+
+
+def test_rdap_base_is_case_insensitive() -> None:
+    assert rdap_base("TECH") == rdap_base("tech")
+
+
+def test_the_snapshot_was_not_shipped_truncated() -> None:
+    """A silently empty or partial JSON would re-open the exact bug above."""
+    from ai_tools_before_launch.filter.rdap_bootstrap import SNAPSHOT_DATE, bootstrap_map
+
+    table = bootstrap_map()
+    assert len(table) > 1000, f"snapshot looks truncated: {len(table)} TLDs"
+    assert all(base.endswith("/domain/") for base in table.values())
+    assert SNAPSHOT_DATE == "2026-11-01"
