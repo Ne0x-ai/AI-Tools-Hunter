@@ -1,3 +1,5 @@
+**English** | [简体中文](README.zh-CN.md)
+
 # AI Tools Before Launch
 
 Find AI tools the day they register a domain — by watching the
