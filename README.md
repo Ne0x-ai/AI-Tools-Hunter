@@ -22,7 +22,7 @@ aggregator, no API keys. Any OpenAI-compatible LLM works.
 
 ## How it works
 
-![AI Tools Before Launch architecture](docs/architecture.svg)
+![AI Tools Before Launch architecture](docs/architecture.png)
 
 <details>
 <summary>Open the interactive diagram</summary>
