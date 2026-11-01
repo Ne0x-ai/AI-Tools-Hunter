@@ -18,8 +18,8 @@ const zh = {
   // ── Header ────────────────────────────────────────────────────────────────
   pipeline: "采集管线",
   pipelineOpen: "查看采集管线",
-  scan: "扫描新工具",
-  scanning: "扫描中…",
+  scan: "处理待探测队列",
+  scanning: "处理中…",
   operator: "审核人",
   operatorUnset: "未设置",
   operatorSet: "设置审核人",
@@ -259,8 +259,8 @@ const en: typeof zh = {
 
   pipeline: "Pipeline",
   pipelineOpen: "Open pipeline panel",
-  scan: "Scan for new tools",
-  scanning: "Scanning…",
+  scan: "Drain queue",
+  scanning: "Draining…",
   operator: "Reviewer",
   operatorUnset: "Not set",
   operatorSet: "Set reviewer",

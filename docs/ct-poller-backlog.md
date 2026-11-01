@@ -6,7 +6,18 @@
 
 - [x] **A1 取消未声明的外部监视器依赖**（2026-09-04）：`discover` 直接复用项目内的 `CTLogFetcher` + `CTIngestOrchestrator`。无需本机 patch，也不会因重新安装而丢失采集能力。
 - [x] **A2 有界运行的故障可见性**（2026-09-04）：CT 源失败会保留异常栈；`discover --max-rounds` 会输出失败计数与原因，并以非零状态退出。
-- [x] **A3 lag 监控**：每日志落后量监控，防高吞吐日志永久落后。`src/ai_tools_before_launch/scheduler/lag_monitor.py` + 测试。
+- [x] **A3 lag 监控**（2026-11-01 在新区建里重建）：每个 cycle 的 `start.cycle.freshness`
+  输出 `entries_behind` / `processed_lag_seconds` / `head_lag_seconds`，`entries_behind > 0`
+  且滞后超阈值时额外吐 `start.lagging`（`--lag-warn-seconds`，默认 120）。
+  设计要点：区分"我们的债"（entries_behind，可行动）与"日志自身的延迟"
+  （head_lag_seconds，是这个方法的物理下限，调参无用）——旧的单一 lag 指标把两者混在一起，
+  既无法判断该不该调参，也无法在 README 里给出诚实的天花板。
+  `src/ai_tools_before_launch/ingest/runner.py`（`measure_freshness` / `_freshness_report`）+ 测试。
+- [x] **A4 RDAP 端点表改成数据**（2026-11-01）：手工维护的 31 项 TLD 表换成 IANA bootstrap
+  离线快照（1203 个 TLD，`filter/rdap_bootstrap.json`）。修掉的召回漏洞是：`.tech`/`.tools`/
+  `.studio`/`.design`/`.website`/`.store`/`.blog`/`.media`/`.codes`/`.bot`/`.in` 等 TLD 没有端点，
+  被判 `rdap_unsupported`，而严格路径里它是**终态**——这些域名连 DNS 都不会查就被永久丢弃。
+  手工表仍然优先（`.io` 不在 IANA bootstrap 里）。刷新方式写在模块 docstring 里。
 - [x] **first-seen 基线（增量版）**：`ct_seen_domains` 表（domain/first_seen_at/first_source）+ `mark_seen`/`filter_new`/`is_seen` + CLI `filter-enrich --fresh-only`。重复输入自动跳过，不浪费 RDAP/探测/LLM 成本。验证：12 域名首跑全 fresh，二跑全 seen（0 处理）。
 
 ## 待办（以后搞）

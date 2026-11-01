@@ -62,6 +62,16 @@ CREATE TABLE IF NOT EXISTS source_cursors (
     cursor TEXT
 );
 
+-- Every read path asks "the latest observation for domain X". Without this
+-- index that is a full scan of ``observations`` per domain: at 50k domains the
+-- overview query took 86 seconds and SQLite's plan said ``SCAN latest``.
+-- ``id DESC`` matches the ``ORDER BY id DESC LIMIT 1`` shape exactly, so the
+-- lookup becomes one index seek. Declared here rather than in an upgrade
+-- function because ``_SCHEMA`` runs on every open: an existing database gains
+-- the index the next time it is opened.
+CREATE INDEX IF NOT EXISTS idx_observations_domain
+    ON observations (domain, id DESC);
+
 CREATE TABLE IF NOT EXISTS ct_seen_domains (
     domain TEXT PRIMARY KEY,
     first_seen_at TEXT NOT NULL,
@@ -151,6 +161,20 @@ CREATE TABLE IF NOT EXISTS review_priorities (
     low_exposure_contribution REAL NOT NULL,
     data_completeness_contribution REAL NOT NULL,
     formula_version TEXT NOT NULL
+);
+
+-- Exactly one row: "the ingest daemon was alive at this moment, this far
+-- behind". Written only by ``start``, read by ``serve`` to decide whether it is
+-- allowed to claim that no work exists. Single-row on purpose — the console
+-- needs liveness, not a history, and a log table would grow forever for a
+-- number nobody reads twice.
+CREATE TABLE IF NOT EXISTS daemon_heartbeat (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    cycle INTEGER,
+    updated_at TEXT NOT NULL,
+    entries_behind INTEGER,
+    processed_lag_seconds REAL,
+    head_lag_seconds REAL
 );
 
 """

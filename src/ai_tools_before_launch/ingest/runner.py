@@ -53,6 +53,9 @@ class StartConfig:
     page_fetch_concurrency: int = 8
     max_rounds: int | None = None
     page_max_attempts: int = 5
+    # Warn when the newest entry we managed to consume is older than this.
+    # ``None`` disables the check; measuring itself always runs.
+    lag_warn_seconds: float | None = 120.0
     # Bounded on purpose: an unbounded hand-off queue lets a fast producer
     # outrun the SQLite writer and grow memory without limit. 8 workers x 64
     # slots is ample headroom while still applying real backpressure.
@@ -79,6 +82,8 @@ class StartConfig:
             raise ValueError("queue_maxsize must be positive or None")
         if self.follow and self.idle_seconds < 0:
             raise ValueError("idle_seconds must be non-negative")
+        if self.lag_warn_seconds is not None and self.lag_warn_seconds < 0:
+            raise ValueError("lag_warn_seconds must be non-negative or None")
         if min(
             self.rdap_concurrency, self.dns_concurrency, self.probe_concurrency
         ) < 1:
@@ -107,6 +112,169 @@ class StartSummary:
             "pending_work": self.pending_work,
             "start_indices": dict(self.start_indices),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class LogFreshness:
+    """How far behind one CT log this database is.
+
+    Three numbers, three questions:
+
+    * ``entries_behind`` — *our* debt. Entries the log has already published
+      that the cursor has not consumed yet. Non-zero means we are the
+      bottleneck, and it is actionable (more page concurrency, smaller pages).
+    * ``processed_lag_seconds`` — how old the newest entry we actually
+      consumed is. This bundles our debt with the log's own publication
+      delay, so it is the honest answer to "how early was this sighting".
+    * ``head_lag_seconds`` — the age of the log's very tail, read directly.
+      This isolates the log's delay and is the floor no CT watcher can beat:
+      if the tail is always 90 seconds old, nothing downstream can be
+      earlier than 90 seconds.
+    """
+
+    log_id: str
+    tree_size: int
+    cursor: int
+    entries_behind: int
+    processed_lag_seconds: float | None
+    head_lag_seconds: float | None
+
+    def as_payload(self) -> dict[str, object]:
+        return {
+            "log": self.log_id,
+            "tree_size": self.tree_size,
+            "cursor": self.cursor,
+            "entries_behind": self.entries_behind,
+            "processed_lag_seconds": self.processed_lag_seconds,
+            "head_lag_seconds": self.head_lag_seconds,
+        }
+
+
+def _lag_seconds(leaf_at: datetime | None, now: datetime) -> float | None:
+    if leaf_at is None:
+        return None
+    return round(max(0.0, (now - leaf_at).total_seconds()), 1)
+
+
+async def _safe_leaf_at(leaf_at, log_id: str, index: int) -> datetime | None:
+    """One entry's log timestamp, or ``None`` if the log cannot answer.
+
+    Measuring freshness must never sink a sweep that already succeeded, so a
+    failed read degrades to "unknown" instead of propagating.
+    """
+    if leaf_at is None or index < 0:
+        return None
+    try:
+        return await leaf_at(log_id, index)
+    except Exception:  # noqa: BLE001 - measurement is best-effort by design
+        return None
+
+
+async def _measure_log(
+    log_id: str,
+    *,
+    cursor: dict[str, int],
+    tree_sizes: dict[str, int],
+    leaf_at,
+    now: datetime,
+) -> LogFreshness:
+    size = tree_sizes[log_id]
+    at = min(max(cursor.get(log_id, 0), 0), size)
+    behind = size - at
+    # The tail read is always needed: it is the log's floor. When we are
+    # caught up it is also the entry we just consumed, so it answers both
+    # questions at the cost of one request instead of two.
+    head_at = await _safe_leaf_at(leaf_at, log_id, size - 1)
+    if behind == 0:
+        processed_at = head_at
+    else:
+        processed_at = await _safe_leaf_at(leaf_at, log_id, at - 1)
+    return LogFreshness(
+        log_id=log_id,
+        tree_size=size,
+        cursor=at,
+        entries_behind=behind,
+        processed_lag_seconds=_lag_seconds(processed_at, now),
+        head_lag_seconds=_lag_seconds(head_at, now),
+    )
+
+
+async def measure_freshness(
+    fetcher: CTLogFetcher,
+    *,
+    cursor: dict[str, int],
+    tree_sizes: dict[str, int],
+    now: datetime | None = None,
+) -> tuple[LogFreshness, ...]:
+    """Measure every reachable log's lag in entries and in seconds.
+
+    Costs one ``get-entries`` round trip per log when caught up, two when
+    behind, and never raises for a single log's failure — an unreadable tail
+    is reported as ``None`` lag rather than aborting the cycle. Fetchers
+    without ``leaf_timestamp`` (duck-typed test doubles) measure nothing and
+    return an empty tuple.
+    """
+    now = now or datetime.now(UTC)
+    leaf_at = getattr(fetcher, "leaf_timestamp", None)
+    if leaf_at is None:
+        return ()
+    results = await asyncio.gather(
+        *(
+            _measure_log(
+                log_id,
+                cursor=cursor,
+                tree_sizes=tree_sizes,
+                leaf_at=leaf_at,
+                now=now,
+            )
+            for log_id, size in tree_sizes.items()
+            if size > 0
+        )
+    )
+    return tuple(results)
+
+
+def _freshness_report(
+    freshness: tuple[LogFreshness, ...], *, lag_warn_seconds: float | None
+) -> tuple[dict[str, object], dict[str, object] | None]:
+    """Build the always-on ``start.freshness`` payload and an optional warning.
+
+    The warning fires only when the lag is *our* fault (``entries_behind > 0``).
+    A stale log tail is reported in the payload but never warned about: it is
+    the physical floor of the whole approach, and no tuning here changes it.
+    """
+    lags = [
+        item.processed_lag_seconds
+        for item in freshness
+        if item.processed_lag_seconds is not None
+    ]
+    head_lags = [
+        item.head_lag_seconds for item in freshness if item.head_lag_seconds is not None
+    ]
+    behind = sum(item.entries_behind for item in freshness)
+    worst = max(lags) if lags else None
+    payload: dict[str, object] = {
+        "entries_behind": behind,
+        "processed_lag_seconds": worst,
+        "head_lag_seconds": max(head_lags) if head_lags else None,
+        "logs": [item.as_payload() for item in freshness],
+    }
+    if (
+        lag_warn_seconds is None
+        or worst is None
+        or behind == 0
+        or worst <= lag_warn_seconds
+    ):
+        return payload, None
+    return payload, {
+        "event": "start.lagging",
+        "entries_behind": behind,
+        "processed_lag_seconds": worst,
+        "hint": (
+            "the cursor is behind the tree head: raise --page-fetch-concurrency, "
+            "lower --page-size, or check the log's own latency in head_lag_seconds"
+        ),
+    }
 
 
 async def locate_start_index(
@@ -199,6 +367,25 @@ async def _run_follow(
     total_candidates = 0
     total_rounds = 0
     first_cycle = True
+    # ``serve`` decides whether an empty queue means "nothing to do" or "nobody
+    # is collecting" from this row, so every progress event doubles as proof of
+    # life. The counter is mutable because the wrapper is created before the
+    # loop knows which cycle it is on.
+    live_cycle = {"value": 0}
+    raw_progress = progress
+
+    def touch() -> None:
+        try:
+            store.record_daemon_heartbeat(
+                cycle=live_cycle["value"], at=datetime.now(UTC)
+            )
+        except Exception as error:  # noqa: BLE001 - liveness must not kill ingest
+            _LOGGER.warning("daemon heartbeat failed: %s", error)
+
+    def progress(event) -> None:
+        touch()
+        raw_progress(event)
+
     since = (
         datetime.now(UTC) - timedelta(hours=config.hours)
         if config.hours is not None
@@ -206,6 +393,10 @@ async def _run_follow(
     )
     while True:
         cycle += 1
+        live_cycle["value"] = cycle
+        # Claim liveness before the first (possibly long) sweep: a cycle that
+        # spends minutes reading pages must not look like a dead process.
+        touch()
         stored = _parse_stored_cursor(store.get_source_cursor(poller.source_name))
         unreachable_errors: dict[str, str] = {}
         tree_sizes = await fetcher.tree_sizes(
@@ -305,6 +496,35 @@ async def _run_follow(
         total_rounds += rounds
         total_probes += cycle_probes
         total_candidates += cycle_candidates
+        # Measured *after* the sweep so the numbers describe what is actually
+        # in the database, not the intent we started the cycle with. A log we
+        # cannot read reports None lag; the cycle still reports.
+        try:
+            freshness = await measure_freshness(
+                fetcher,
+                cursor=_parse_stored_cursor(store.get_source_cursor(poller.source_name)),
+                tree_sizes=tree_sizes,
+            )
+        except Exception as error:  # noqa: BLE001 - never sink a finished cycle
+            _LOGGER.warning("freshness measurement failed: %s", error)
+            freshness = ()
+        freshness_payload, lagging = _freshness_report(
+            freshness, lag_warn_seconds=config.lag_warn_seconds
+        )
+        # Persist the measurement with the liveness bump. Until now the only
+        # way to read "how far behind are we" was to tail the daemon's log file
+        # over HTTP; the console can now answer it from the same row it already
+        # reads to decide whether a daemon exists.
+        try:
+            store.record_daemon_heartbeat(
+                cycle=cycle,
+                at=datetime.now(UTC),
+                entries_behind=freshness_payload["entries_behind"],
+                processed_lag_seconds=freshness_payload["processed_lag_seconds"],
+                head_lag_seconds=freshness_payload["head_lag_seconds"],
+            )
+        except Exception as error:  # noqa: BLE001 - never sink a finished cycle
+            _LOGGER.warning("daemon heartbeat measurement failed: %s", error)
         progress(
             {
                 "event": "start.cycle",
@@ -316,8 +536,11 @@ async def _run_follow(
                 "pending_work": store.pending_ct_discovery_work_count(),
                 "total_ingested": total_ingested,
                 "total_candidates": total_candidates,
+                "freshness": freshness_payload,
             }
         )
+        if lagging is not None:
+            progress({**lagging, "cycle": cycle})
         await asyncio.sleep(config.idle_seconds)
 
 

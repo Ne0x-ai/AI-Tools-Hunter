@@ -1,6 +1,6 @@
 # 筛选层设计与验证记录
 
-> 初稿记录于 2026-09-01，严格策略更新于 2026-09-04。采集层之后的过滤漏斗：把已配置 CT 日志中首次观察到的注册级域名过滤成可审计的"真新网站"候选队列。
+> 初稿记录于 2026-09-01，严格策略更新于 2026-09-04，运行边界与 RDAP 表更新于 2026-11-01。采集层之后的过滤漏斗：把已配置 CT 日志中首次观察到的注册级域名过滤成可审计的"真新网站"候选队列。
 > 状态：**S1-S5 已实现**；所有会写入审核队列的命令都强制 RDAP、DNS 与最终根域一致性门槛。
 
 ## 目标
@@ -37,13 +37,16 @@
 - **随机字符检测**：元音/辅音比、连续辅音数、字典词匹配。示例：`wasyal.com`（垃圾农场特征）vs `moralespsychservices.com`（真品牌）。
 - **科技 TLD 加权**：`.ai`/`.io`/`.dev`/`.app` 加分；`.xyz`/`.top` 中性偏疑（不绝对）。
 - **批量注册指纹**：同注册商 + 同注册日 + 命名相似 → 垃圾农场信号。
+- **默认只打分、不做门控**：`score_domain()` 的结果会写进证据供 review 参考，但默认**不参与**准入判断——这个项目的目标是召回，不是干净。需要压缩下游成本时用 `--min-name-score`（0–1，默认 0）显式开启：S1 是唯一零成本的阶段，开启后它在 RDAP 之前拦截，省下 S2 的配额。被拦下的决策 `retryable=False`，因为名字形态不会因为重试而改变。
 
 ### S2 RDAP 注册时间（核心刀）
 - **双桶**：`≤30 天` Tier 1（高优先级）；`31-90 天` Tier 2（标记 "slow starter"，人工可翻）；`>90 天` 丢弃。
 - **阈值可配置**（`--tier1-days` / `--tier2-days`）。
 - **交叉验证**：`注册日期 ≤ 证书 first-seen 日期` 才合理；若 first-seen 早于注册日期 → 域名刚易主（老域名新注册），自动降级。
-- **失败重试**：RDAP 暂不可用（如部分 TLD 或网络故障）不会降级为候选，也不会永久丢弃；域名保留在持久化工作队列中等待重试。
-- 技术：RDAP（非传统 WHOIS），免费无 key，Verisign + 各 TLD RDAP 已验证可用。
+- **端点表是数据，不是代码**：`filter/rdap_bootstrap.json` 是 IANA `dns.json` 的离线快照（1203 个 TLD），由 `rdap_bootstrap.py` 读取。手工维护的 `_TLD_RDAP` 仍然优先（`.io` 不在 IANA bootstrap 里，`.ai` 两边 URL 不同，以手工表为准）。刷新命令写在模块 docstring 里。
+- **两类失败要分开**：
+  - **网络类**（超时、429、5xx）→ 可重试，域名留在 `ct_discovery_work` 里等下一轮，`retryable=True`。
+  - **`rdap_unsupported`**（IANA 也没有该 TLD 的 RDAP 服务，如 `.cn`/`.jp`/`.sh`/`.so`）→ **在严格路径下是终态**，不重试。上 IANA bootstrap 之前，这个判定会误伤 `.tech`/`.tools`/`.studio`/`.design`/`.store`/`.in` 等大批后缀，因为它们根本不在手工表里；现在剩下的只有真的没有 RDAP 的 TLD。
 
 ### S3 DNS 探测（便宜）
 - A 记录存在才进入严格候选路径。
@@ -55,6 +58,34 @@
 ### S5 AI 判型（可选）
 - 规则预筛（`build_rule_candidate_draft`）+ 可选 LLM 判型（MiniMax/OpenAI-compatible）。
 - LLM 失败不会撤销已通过 S1-S4 严格证据的候选；只会跳过附加的模型版本。
+
+## 运行边界（2026-11-01）
+
+漏斗不是骨架，`ct_discovery_work` 这张租约队列才是。`start` 把新域名投进队列，`serve` 从队列里领活——S1–S5 只是队列消费者内部的一个函数。这个区分之所以重要，是因为它决定了「谁能写哪张表」：
+
+| 表 | `start` | `serve` |
+|---|---|---|
+| `source_events` / `ct_seen_domains` / `source_cursors` | **写** | 读 |
+| `ct_discovery_work` | 写 | 写（租约） |
+| `observations` / `candidates` / 版本 / 优先级 | 写 | 写（租约） |
+| `review_decisions` | 读 | **写** |
+| `daemon_heartbeat` | **写** | 读 |
+
+两条采集路径同时写游标不可能正确，所以 `POST /v1/run/discovery` 现在只做 `run_once(poll=False)`——它消费队列，不再自己抓 CT。`CTIngestOrchestrator` 的 `poller` 参数因此变成可选，且 `poll=True` 时缺失会直接 `ValueError`，从代码层面堵掉误用。
+
+`daemon_heartbeat` 是一张单行表，由 `start` 每个 progress 事件和每个 cycle 末写入。没有它，「队列空」有两种截然不同的含义无法区分：真的消化完了，还是根本没人采集。控制台现在读这张表来判断。
+
+## 新鲜度指标
+
+每个 cycle 输出三个数，它们回答三个不同的问题，不要合并：
+
+| 字段 | 含义 | 归属 |
+|---|---|---|
+| `entries_behind` | 日志已发布、游标未消化的条数 | 自己的债，可行动 |
+| `processed_lag_seconds` | 最新消化那条的年龄 | 自己的债 + 日志延迟 = 实际有多早 |
+| `head_lag_seconds` | 日志尾部那条的年龄 | 日志自身延迟，任何人从 CT 都突破不了的下限 |
+
+`entries_behind > 0` 时发 `start.lagging` 并指向 `--page-fetch-concurrency`。`entries_behind == 0` 但 `head_lag_seconds` 仍很大，那是日志慢，不是代码问题。默认阈值 `--lag-warn-seconds 120`。追平时每个日志每 cycle 只多一次 `get-entries`（读 1 条）。
 
 ## 架构决策（已定）
 

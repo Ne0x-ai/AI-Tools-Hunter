@@ -118,6 +118,7 @@ def _start(args: argparse.Namespace) -> int:
             probe_concurrency=args.probe_concurrency,
             page_fetch_concurrency=args.page_fetch_concurrency,
             max_rounds=args.max_rounds,
+            lag_warn_seconds=args.lag_warn_seconds,
         )
         store = SQLiteStore(args.database)
         logs = tuple(args.logs) if args.logs else (DEFAULT_LOG,)
@@ -134,6 +135,7 @@ def _start(args: argparse.Namespace) -> int:
                     tier2_days=args.tier2_days,
                     require_dns=True,
                     drop_unknown_rdap=True,
+                    min_name_score=args.min_name_score,
                     rdap_concurrency=config.rdap_concurrency,
                     dns_concurrency=config.dns_concurrency,
                 )
@@ -233,6 +235,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "follow the shared 1h/6h/24h/72h network schedule instead",
     )
     start_cmd.add_argument("--max-rounds", type=int)
+    start_cmd.add_argument(
+        "--min-name-score", type=float, default=0.0,
+        help="drop domains whose S1 name score is below this before spending "
+        "RDAP quota (0-1, default 0 = keep everything: recall first)",
+    )
+    start_cmd.add_argument(
+        "--lag-warn-seconds", type=float, default=120.0,
+        help="warn when the newest consumed entry is older than this "
+        "(default 120). Measurement always runs; 0 warns on any lag at all, "
+        "a very large value silences the warning",
+    )
     start_cmd.add_argument("--tier1-days", type=int, default=30)
     start_cmd.add_argument("--tier2-days", type=int, default=90)
     start_cmd.add_argument(

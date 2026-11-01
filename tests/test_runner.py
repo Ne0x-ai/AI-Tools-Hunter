@@ -532,3 +532,268 @@ def test_digest_loop_exits_when_nothing_is_due_even_if_work_is_pending() -> None
     assert events[-1]["event"] == "start.cycle", "the cycle never finished"
     assert digest_rounds == 0, "a round ran even though nothing was due"
     assert json.loads(store.cursor or "{}") == {"alive": 1}
+
+
+class _StampFetcher:
+    """A log whose entry ages are known and whose reads are counted."""
+
+    def __init__(self, size: int, *, tail_age_seconds: int = 30) -> None:
+        self.size = size
+        self.tail_age_seconds = tail_age_seconds
+        self.reads: list[tuple[str, int]] = []
+        self.fail = False
+
+    @property
+    def logs(self):  # noqa: ANN201 - duck-typed for the runner
+        return (type("_Log", (), {"log_id": "log"})(),)
+
+    async def leaf_timestamp(self, log_id: str, index: int):  # noqa: ANN201
+        if self.fail:
+            raise RuntimeError("log answered 503")
+        self.reads.append((log_id, index))
+        now = datetime.now(UTC)
+        # Index 0 is oldest; each step is one minute, and the tail sits
+        # `tail_age_seconds` behind the wall clock.
+        return now - timedelta(seconds=self.tail_age_seconds + 60 * (self.size - 1 - index))
+
+    async def tree_sizes(self) -> dict[str, int]:
+        return {"log": self.size}
+
+
+def test_measure_freshness_separates_our_debt_from_the_logs_own_lag() -> None:
+    """Behind by 100 entries, but the log tail itself is 30s old.
+
+    ``entries_behind`` is our own debt (actionable), ``processed_lag_seconds``
+    is what the sighting really costs in seconds, and ``head_lag_seconds``
+    isolates the log's publication delay — the floor nobody can beat.
+    """
+    import asyncio
+
+    from ai_tools_before_launch.ingest.runner import measure_freshness
+
+    fetcher = _StampFetcher(1000, tail_age_seconds=30)
+    measured = asyncio.run(
+        measure_freshness(fetcher, cursor={"log": 900}, tree_sizes={"log": 1000})
+    )
+
+    assert len(measured) == 1
+    log = measured[0]
+    assert log.entries_behind == 100
+    assert log.cursor == 900
+    # tail is 30s old; index 899 is 100 entries earlier = 6000s more
+    assert log.processed_lag_seconds == pytest.approx(6030, abs=5)
+    assert log.head_lag_seconds == pytest.approx(30, abs=5)
+
+
+def test_measure_freshness_reads_the_tail_once_when_caught_up() -> None:
+    """Caught up means the tail read answers both questions: one request."""
+    import asyncio
+
+    from ai_tools_before_launch.ingest.runner import measure_freshness
+
+    fetcher = _StampFetcher(1000, tail_age_seconds=12)
+    measured = asyncio.run(
+        measure_freshness(fetcher, cursor={"log": 1000}, tree_sizes={"log": 1000})
+    )
+
+    log = measured[0]
+    assert log.entries_behind == 0
+    assert log.processed_lag_seconds == pytest.approx(12, abs=5)
+    assert fetcher.reads == [("log", 999)], "a caught-up log must cost one read"
+
+
+def test_measure_freshness_survives_an_unreadable_log() -> None:
+    """Measuring must never fail a cycle that already ingested successfully."""
+    import asyncio
+
+    from ai_tools_before_launch.ingest.runner import measure_freshness
+
+    fetcher = _StampFetcher(10)
+    fetcher.fail = True
+    measured = asyncio.run(
+        measure_freshness(fetcher, cursor={"log": 5}, tree_sizes={"log": 10})
+    )
+
+    log = measured[0]
+    assert log.entries_behind == 5
+    assert log.processed_lag_seconds is None and log.head_lag_seconds is None
+
+
+def test_freshness_report_warns_only_when_we_are_the_bottleneck() -> None:
+    """A stale log tail is the floor of the approach, not a fault of ours."""
+    from ai_tools_before_launch.ingest.runner import LogFreshness, _freshness_report
+
+    def entry(behind: int, processed: float, head: float) -> LogFreshness:
+        return LogFreshness(
+            log_id="log",
+            tree_size=1000,
+            cursor=1000 - behind,
+            entries_behind=behind,
+            processed_lag_seconds=processed,
+            head_lag_seconds=head,
+        )
+
+    payload, warning = _freshness_report(
+        (entry(0, 900.0, 900.0),), lag_warn_seconds=120.0
+    )
+    assert payload["processed_lag_seconds"] == 900.0
+    assert warning is None, "a slow log must not be reported as our own lag"
+
+    payload, warning = _freshness_report(
+        (entry(250, 640.0, 30.0),), lag_warn_seconds=120.0
+    )
+    assert payload["entries_behind"] == 250
+    assert warning is not None and warning["event"] == "start.lagging"
+
+    _, warning = _freshness_report((entry(250, 640.0, 30.0),), lag_warn_seconds=900.0)
+    assert warning is None, "a threshold above the observed lag must stay quiet"
+
+
+def test_start_config_rejects_a_negative_lag_threshold() -> None:
+    with pytest.raises(ValueError):
+        StartConfig(lag_warn_seconds=-1)
+
+
+def test_name_score_threshold_gates_before_rdap_but_keeps_input_order() -> None:
+    """S1 is free and S2 costs a rate-limited request, so it runs first.
+
+    The rejection must still be reported as a decision for its own domain, in
+    the caller's order: the orchestrator settles exactly the items it claimed.
+    """
+    from ai_tools_before_launch.filter.pipeline import FilterPipeline
+
+    asked: list[str] = []
+
+    def rdap(domain: str):  # noqa: ANN202
+        asked.append(domain)
+        return Registration(
+            domain=domain,
+            registration_date=datetime.now(UTC) - timedelta(days=3),
+            registrar="Test",
+            statuses=(),
+        )
+
+    domains = ["xqztvbk.xyz", "openmind.tech", "moralespsychservices.com"]
+    pipeline = FilterPipeline(
+        rdap_fetcher=rdap,
+        dns_checker=lambda kept: {},
+        min_name_score=0.3,
+    )
+    decisions = pipeline.evaluate(domains)
+
+    assert [d.domain for d in decisions] == domains, "input order must survive"
+    rejected = [d for d in decisions if d.reason == "name_score_low"]
+    assert [d.domain for d in rejected] == ["xqztvbk.xyz"]
+    assert rejected[0].retryable is False, "a name score never improves by retrying"
+    assert "xqztvbk.xyz" not in asked, "a gated domain must not spend RDAP quota"
+    assert {"openmind.tech", "moralespsychservices.com"} <= set(asked)
+
+
+def test_name_score_threshold_of_zero_keeps_everything() -> None:
+    """Recall is the default: the tool exists to find things, not to filter."""
+    from ai_tools_before_launch.filter.pipeline import FilterPipeline
+
+    domains = ["xqztvbk.xyz", "a1b2c3d4.tech"]
+    only_counts = {"rdap": 0}
+
+    def rdap(domain: str):  # noqa: ANN202
+        only_counts["rdap"] += 1
+        return Registration(
+            domain=domain,
+            registration_date=datetime.now(UTC) - timedelta(days=3),
+            registrar="Test",
+            statuses=(),
+        )
+
+    decisions = FilterPipeline(rdap_fetcher=rdap, dns_checker=lambda kept: {}).evaluate(
+        domains
+    )
+
+    assert [d.domain for d in decisions] == domains
+    assert all(d.candidate is not None for d in decisions)
+    assert only_counts["rdap"] == 2
+
+
+def test_filter_pipeline_rejects_an_out_of_range_name_score() -> None:
+    from ai_tools_before_launch.filter.pipeline import FilterPipeline
+
+    with pytest.raises(ValueError):
+        FilterPipeline(min_name_score=1.5)
+
+
+class _CycleStore:
+    """Cursor + counters, enough for one caught-up cycle."""
+
+    def __init__(self, cursor: str) -> None:
+        self.cursor = cursor
+
+    def get_source_cursor(self, _name: str) -> str:
+        return self.cursor
+
+    def set_source_cursor(self, _name: str, cursor: str) -> None:
+        self.cursor = cursor
+
+    def pending_ct_discovery_work_count(self) -> int:
+        return 0
+
+    def due_ct_discovery_work_count(self, *, now) -> int:  # noqa: ANN001
+        return 0
+
+
+def test_run_follow_reports_freshness_on_every_cycle() -> None:
+    """The measurement has to reach the caller, not just the unit tests.
+
+    A caught-up log whose tail is 500 seconds old is *not* our lag, so the
+    cycle reports it and stays quiet — the exact opposite of the old
+    behaviour, where nothing was reported at all.
+    """
+    import asyncio
+    import json
+
+    from ai_tools_before_launch.ingest.runner import _run_follow
+
+    class _Stop(Exception):
+        pass
+
+    class _Log:
+        log_id = "log"
+
+    class _Fetcher:
+        logs = (_Log(),)
+
+        async def tree_sizes(self, *, on_error=None) -> dict[str, int]:
+            return {"log": 100}
+
+        async def leaf_timestamp(self, _log_id: str, _index: int):  # noqa: ANN201
+            return datetime.now(UTC) - timedelta(seconds=500)
+
+    class _Poller:
+        source_name = "ct_log"
+
+    events: list[dict] = []
+
+    def progress(event: dict) -> None:
+        events.append(event)
+        if event["event"] == "start.cycle":
+            raise _Stop
+
+    async def go() -> None:
+        with pytest.raises(_Stop):
+            await _run_follow(
+                store=_CycleStore(json.dumps({"log": 100})),
+                fetcher=_Fetcher(),
+                poller=_Poller(),
+                digest_once=lambda: None,
+                config=StartConfig(entries=1, idle_seconds=0.0),
+                progress=progress,
+            )
+
+    asyncio.run(go())
+
+    cycle = events[-1]
+    assert cycle["event"] == "start.cycle"
+    freshness = cycle["freshness"]
+    assert freshness["entries_behind"] == 0
+    assert freshness["processed_lag_seconds"] == pytest.approx(500, abs=5)
+    assert freshness["logs"][0]["log"] == "log"
+    assert [e["event"] for e in events].count("start.lagging") == 0

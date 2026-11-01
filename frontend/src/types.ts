@@ -129,23 +129,40 @@ export interface DomainSnapshot {
   detail: string | null;
 }
 
+/**
+ * Liveness of the ingest daemon, as reported by the server.
+ *
+ * The console drains the work queue but never reads CT logs — that is the
+ * `start` process's job, and there is exactly one of it. Without this the UI
+ * cannot tell "nothing to do" from "nobody is collecting anything".
+ */
+export interface DaemonStatus {
+  running: boolean;
+  last_seen_at?: string;
+  age_seconds?: number;
+  stale_after_seconds: number;
+  cycle?: number | null;
+  entries_behind?: number | null;
+  processed_lag_seconds?: number | null;
+  head_lag_seconds?: number | null;
+  hint?: string;
+}
+
 export interface DiscoveryOverview {
   cursor: string | null;
   domains: DomainSnapshot[];
   counts: DiscoveryCounts;
+  daemon?: DaemonStatus;
 }
 
 export interface DiscoveryRunSummary {
-  status: "completed" | "queued" | "no_candidates";
-  next_cursor: string | null;
-  certificates_seen: number;
-  events_added: number;
-  roots_observed: number;
-  strict_rejections: number;
+  status: "completed" | "queued" | "no_candidates" | "no_work";
+  due_work: number;
+  pending_work: number;
   probes_run: number;
   candidates_created: number;
-  source_errors: string[];
-  pending_work: number;
+  strict_rejections: number;
+  daemon: DaemonStatus;
 }
 
 /** A decision the console has committed, kept locally so the queue can react. */

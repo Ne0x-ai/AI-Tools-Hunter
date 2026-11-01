@@ -86,12 +86,22 @@ function Console() {
     try {
       const summary = await api.runDiscovery(20);
       const created = summary.candidates_created;
+      const daemonRunning = summary.daemon.running;
+      const message =
+        summary.status === "no_work"
+          ? lang === "zh"
+            ? `队列里没有待探测的域名 — 采集由 start 进程负责，当前${
+                daemonRunning ? "正在运行" : "未运行"
+              }`
+            : `Nothing queued — collection belongs to the start process, which is currently ${
+                daemonRunning ? "running" : "not running"
+              }`
+          : lang === "zh"
+            ? `探测了 ${summary.probes_run} 个域名，新增 ${created} 个候选`
+            : `Probed ${summary.probes_run} domains, ${created} new candidates`;
       toast.push({
-        tone: created > 0 ? "success" : "info",
-        message:
-          lang === "zh"
-            ? `扫描完成：${summary.certificates_seen} 张证书，新增 ${created} 个候选`
-            : `Scan done: ${summary.certificates_seen} certificates, ${created} new candidates`,
+        tone: created > 0 ? "success" : summary.status === "no_work" ? "danger" : "info",
+        message,
       });
       await Promise.all([loadQueue(), loadCounts()]);
       setPipelineToken((token) => token + 1);

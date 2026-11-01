@@ -24,16 +24,11 @@ aggregator, no API keys. Any OpenAI-compatible LLM works.
 
 ## How it works
 
-![AI Tools Before Launch architecture](docs/architecture.png)
+![AI Tools Before Launch architecture](docs/architecture.svg)
 
-<details>
-<summary>Open the interactive diagram</summary>
-
-[`docs/architecture.html`](docs/architecture.html) — explore nodes, trace
-paths, and switch themes. Generated with
-[Archify](https://github.com/tt-a1i/archify).
-
-</details>
+`start` is the only writer of ingest tables. `serve` reads them and writes
+only review decisions, so the two processes never race over the cursor. The
+diagram source is [`docs/architecture.json`](docs/architecture.json).
 
 The pipeline flows left to right:
 
@@ -41,8 +36,8 @@ The pipeline flows left to right:
 |---|---|
 | CT logs | Poll configured RFC 6962 logs (default: Cloudflare Nimbus 2026) |
 | First-seen baseline | `ct_seen_domains` — first sighting is the signal |
-| S1 static signals | Domain-name shape: brand-like vs random spam |
-| S2 RDAP age | ≤30d → tier 1 · ≤90d → tier 2 · older → drop |
+| S1 static signals | Domain-name shape score: brand-like vs random spam (evidence only by default; `--min-name-score` makes it gate) |
+| S2 RDAP age | ≤30d → tier 1 · ≤90d → tier 2 · older → drop (endpoint table from the IANA bootstrap, 1,200+ TLDs) |
 | S3 DNS presence | Does the domain resolve at all? |
 | S4 live probe | Bounded HTTP probe, SSRF-guarded, evidence quotes |
 | S5 LLM classify | Optional, fixed schema, evidence-restricted |
@@ -114,8 +109,16 @@ ai-tools-before-launch serve --database ./ai-tools-before-launch.db
 The home page is the candidate inbox: undecided candidates sorted by
 review priority. Click into a candidate to see its persisted evidence,
 then approve, defer, reject, or blocklist. Actions require an
-`X-Actor-ID` and are recorded in SQLite. "扫描新网站" triggers one
-strict CT pass via `POST /v1/run/discovery`.
+`X-Actor-ID` and are recorded in SQLite.
+
+**The console does not read CT logs.** Ingestion has exactly one writer, the
+`start` daemon, and running two of them would mean two processes advancing the
+same cursor. `serve` can only *drain* the work queue the daemon already filled
+(`POST /v1/run/discovery`), and it tells you which of the two situations you are
+in: `no_work` with `daemon.running: false` means nothing is being collected,
+while `no_work` with `daemon.running: true` means you are caught up. Run
+`start` in another terminal — or under systemd/launchd — for the console to
+have anything to show.
 
 ### How `start` behaves
 
@@ -134,6 +137,38 @@ rate limits; the concurrency knobs (`--rdap-concurrency`,
 trade speed against politeness, and `--filter-retry-delay` controls how
 fast failed DNS/RDAP checks come back for another try.
 
+## How early are you, actually?
+
+That is the only number this project really promises, so it is printed every
+cycle instead of being left to vibes. Each `start.cycle` event carries a
+`freshness` object where three numbers answer three different questions:
+
+| Field | Answers | Whose fault |
+|---|---|---|
+| `entries_behind` | entries the log has published but the cursor has not consumed | **ours** — actionable |
+| `processed_lag_seconds` | age of the newest entry we actually consumed | ours + the log's own delay = how early this sighting really was |
+| `head_lag_seconds` | age of the log's very tail, read directly | the log's delay — the floor no CT watcher can beat |
+
+```jsonc
+{"event": "start.cycle", "cycle": 7, "freshness": {
+  "entries_behind": 0, "processed_lag_seconds": 41.2, "head_lag_seconds": 41.2,
+  "logs": [{"log": "cloudflare-nimbus2026", "tree_size": 981234567,
+            "cursor": 981234567, "entries_behind": 0,
+            "processed_lag_seconds": 41.2, "head_lag_seconds": 41.2}]}}
+```
+
+`entries_behind > 0` means **you** are the bottleneck — the log moved and the
+cursor did not — so an extra `start.lagging` event points at
+`--page-fetch-concurrency` / `--page-size`. `entries_behind == 0` with a large
+`head_lag_seconds` means the log itself is slow: that is not a bug, it is the
+physical floor of the whole approach, and no knob here changes it. The warning
+threshold is 120 seconds by default (`--lag-warn-seconds`; `0` warns on any lag
+at all).
+
+One honest caveat: during a cold backfill (`--entries`) `entries_behind` is
+large by construction, so the warning keeps firing. That is real lag, not a
+false alarm.
+
 ## HTTP API
 
 Loopback-only unless `--host 0.0.0.0`. The API has **no authentication** —
@@ -147,8 +182,9 @@ reach it through an SSH tunnel (`ssh -L 8000:127.0.0.1:8000 server`).
 | `GET` | `/v1/candidates/{id}/versions/{v}/review-context` | immutable version |
 | `POST` | `/v1/candidates/{id}/versions/{v}/decisions` | idempotent on `request_id` |
 | `POST` | `/v1/candidates/{id}/versions/{v}/decisions/{d}/revoke` | undo a decision |
-| `POST` | `/v1/run/discovery` | one strict CT pass |
-| `GET` | `/v1/discovery/overview` | domains, cursor, funnel counts |
+| `POST` | `/v1/run/discovery` | drain due work from the queue (never reads CT) |
+| `GET` | `/v1/discovery/overview` | domains, cursor, funnel counts, daemon state |
+| `GET` | `/v1/discovery/log` | tail of the daemon's log file |
 | `GET` | `/healthz` | `{"ok": true}` |
 
 ## Run it 24/7

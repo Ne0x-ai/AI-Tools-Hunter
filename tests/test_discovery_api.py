@@ -1,10 +1,54 @@
-"""Tests for the web one-click discovery API surface."""
+"""Tests for the web discovery API surface.
+
+The contract changed with the single-writer split: ``POST /v1/run/discovery``
+means "drain what the daemon queued", not "go read CT logs". These tests pin
+both halves — what the endpoint does, and what it must never be able to do.
+"""
+
+from __future__ import annotations
+
+import inspect
+from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
-from ai_tools_before_launch.api import discovery
-from ai_tools_before_launch.api import create_app
+from ai_tools_before_launch.api import create_app, discovery
 from ai_tools_before_launch.ingest.ct_orchestrator import CTIngestRunSummary
+from ai_tools_before_launch.storage.sqlite import SQLiteStore
+
+
+def _summary(**overrides) -> CTIngestRunSummary:
+    payload = {
+        "certificates_seen": 0,
+        "events_added": 0,
+        "probes_run": 0,
+        "candidates_created": 0,
+        "next_cursor": None,
+    }
+    payload.update(overrides)
+    return CTIngestRunSummary(**payload)
+
+
+class _CapturingOrchestrator:
+    """Records how the endpoint constructed and drove the orchestrator."""
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        captured["init"] = kwargs
+        captured["run_once"] = []
+
+    async def run_once(self, *, poll: bool = True) -> CTIngestRunSummary:
+        captured["run_once"].append({"poll": poll})
+        return captured["summary"]
+
+
+captured: dict[str, object] = {}
+
+
+def _install(monkeypatch, summary: CTIngestRunSummary) -> None:
+    captured.clear()
+    captured["summary"] = summary
+    monkeypatch.setattr(discovery, "CTIngestOrchestrator", _CapturingOrchestrator)
 
 
 def test_discovery_overview_empty(tmp_path) -> None:
@@ -14,6 +58,7 @@ def test_discovery_overview_empty(tmp_path) -> None:
     payload = response.json()
     assert payload["domains"] == []
     assert payload["counts"]["source_events"] == 0
+    assert payload["daemon"]["running"] is False
 
 
 def test_legacy_dashboard_routes_redirect_to_inbox(tmp_path) -> None:
@@ -31,198 +76,124 @@ def test_discovery_run_validates_max_probes(tmp_path) -> None:
     assert response.status_code == 422
 
 
+def test_the_console_never_reads_ct_logs(monkeypatch, tmp_path) -> None:
+    """Ingest has one writer. The API module must not even link the adapter.
+
+    Asserting on behaviour alone would miss the day someone re-adds polling
+    behind a flag; asserting on the import list makes the boundary structural.
+    """
+    source = inspect.getsource(discovery)
+
+    assert "CTLogFetcher" not in source
+    assert "CTPoller(" not in source
+    assert "DEFAULT_LOG" not in source
+
+
+def test_web_discovery_drains_the_queue_without_polling(monkeypatch, tmp_path) -> None:
+    """``poll=False`` and no poller: the two facts that make this safe."""
+    _install(monkeypatch, _summary(probes_run=3, candidates_created=1))
+
+    response = TestClient(create_app(tmp_path / "drain.db")).post(
+        "/v1/run/discovery", json={"max_probes": 5}
+    )
+
+    assert response.status_code == 200
+    assert captured["run_once"] == [{"poll": False}]
+    assert "poller" not in captured["init"], "a poller would let the console ingest"
+
+
 def test_web_discovery_requires_verified_age_and_dns_before_l1(
     monkeypatch, tmp_path
 ) -> None:
     """The browser action must opt into the strict CT gate before probing."""
-    captured: dict[str, object] = {}
-
-    class _FakeFetcher:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args) -> None:
-            return None
-
-    class _FakePoller:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-    class _FakeProbeContext:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args) -> None:
-            return None
-
-    class _FakePipeline:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-    class _CapturingOrchestrator:
-        def __init__(self, **kwargs) -> None:
-            captured.update(kwargs)
-
-        async def run_once(self) -> CTIngestRunSummary:
-            return CTIngestRunSummary(
-                certificates_seen=12,
-                events_added=8,
-                probes_run=3,
-                candidates_created=1,
-                next_cursor="42",
-                roots_observed=8,
-                strict_rejections=5,
-            )
-
-    monkeypatch.setattr(discovery, "CTLogFetcher", _FakeFetcher)
-    monkeypatch.setattr(discovery, "CTPoller", _FakePoller)
-    monkeypatch.setattr(discovery, "HTTPProbe", _FakeProbeContext)
-    monkeypatch.setattr(discovery, "AIToolsBeforeLaunchPipeline", _FakePipeline)
-    monkeypatch.setattr(discovery, "CTIngestOrchestrator", _CapturingOrchestrator)
+    _install(monkeypatch, _summary(probes_run=3, candidates_created=1))
 
     response = TestClient(create_app(tmp_path / "strict.db")).post(
         "/v1/run/discovery", json={"max_probes": 5}
     )
 
     assert response.status_code == 200
-    assert response.json() == {
-        "status": "completed",
-        "next_cursor": "42",
-        "certificates_seen": 12,
-        "events_added": 8,
-        "roots_observed": 8,
-        "strict_rejections": 5,
-        "probes_run": 3,
-        "candidates_created": 1,
-        "source_errors": [],
-        "pending_work": 0,
-    }
-    strict_filter = captured["filter_pipeline"]
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["probes_run"] == 3
+    assert body["candidates_created"] == 1
+    # The console cannot report ingest numbers, because it does not ingest.
+    assert "certificates_seen" not in body
+    assert "next_cursor" not in body
+
+    strict_filter = captured["init"]["filter_pipeline"]
     assert strict_filter._drop_unknown_rdap is True
     assert strict_filter._require_dns is True
-    assert captured["require_first_seen"] is True
+    assert captured["init"]["require_first_seen"] is True
 
 
-def test_web_discovery_calls_an_empty_strict_run_no_candidates(monkeypatch, tmp_path) -> None:
-    class _FakeFetcher:
-        def __init__(self, **_kwargs) -> None:
-            pass
+def test_web_discovery_reports_no_work_and_a_dead_daemon(monkeypatch, tmp_path) -> None:
+    """"Nothing to do" and "nobody is collecting" must not look the same."""
+    _install(monkeypatch, _summary())
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args) -> None:
-            return None
-
-    class _FakePoller:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-    class _FakeProbeContext:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args) -> None:
-            return None
-
-    class _FakePipeline:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-    class _EmptyOrchestrator:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-        async def run_once(self) -> CTIngestRunSummary:
-            return CTIngestRunSummary(
-                certificates_seen=4,
-                events_added=4,
-                probes_run=0,
-                candidates_created=0,
-                next_cursor="9",
-                roots_observed=4,
-                strict_rejections=4,
-            )
-
-    monkeypatch.setattr(discovery, "CTLogFetcher", _FakeFetcher)
-    monkeypatch.setattr(discovery, "CTPoller", _FakePoller)
-    monkeypatch.setattr(discovery, "HTTPProbe", _FakeProbeContext)
-    monkeypatch.setattr(discovery, "AIToolsBeforeLaunchPipeline", _FakePipeline)
-    monkeypatch.setattr(discovery, "CTIngestOrchestrator", _EmptyOrchestrator)
-
-    response = TestClient(create_app(tmp_path / "empty.db")).post(
+    response = TestClient(create_app(tmp_path / "idle.db")).post(
         "/v1/run/discovery", json={"max_probes": 5}
     )
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "no_candidates"
-    assert response.json()["strict_rejections"] == 4
+    body = response.json()
+    assert body["status"] == "no_work"
+    assert body["due_work"] == 0
+    assert body["daemon"]["running"] is False
+    assert "hint" in body["daemon"]
 
 
-def test_web_discovery_reports_queued_work_and_partial_source_failure(
-    monkeypatch, tmp_path
-) -> None:
-    """The UI API must distinguish unfinished work from an empty result."""
-
-    class _FakeFetcher:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args) -> None:
-            return None
-
-    class _FakePoller:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-    class _FakeProbeContext:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args) -> None:
-            return None
-
-    class _FakePipeline:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-    class _QueuedOrchestrator:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-        async def run_once(self) -> CTIngestRunSummary:
-            return CTIngestRunSummary(
-                certificates_seen=6,
-                events_added=6,
-                probes_run=2,
-                candidates_created=0,
-                next_cursor="10",
-                roots_observed=6,
-                strict_rejections=1,
-                source_errors=("Nimbus endpoint timed out",),
-                pending_work=4,
-            )
-
-    monkeypatch.setattr(discovery, "CTLogFetcher", _FakeFetcher)
-    monkeypatch.setattr(discovery, "CTPoller", _FakePoller)
-    monkeypatch.setattr(discovery, "HTTPProbe", _FakeProbeContext)
-    monkeypatch.setattr(discovery, "AIToolsBeforeLaunchPipeline", _FakePipeline)
-    monkeypatch.setattr(discovery, "CTIngestOrchestrator", _QueuedOrchestrator)
+def test_web_discovery_reports_queued_work(monkeypatch, tmp_path) -> None:
+    """Unfinished work is not an empty result."""
+    _install(monkeypatch, _summary(probes_run=2, pending_work=4))
 
     response = TestClient(create_app(tmp_path / "queued.db")).post(
         "/v1/run/discovery", json={"max_probes": 5}
     )
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "queued"
-    assert response.json()["pending_work"] == 4
-    assert response.json()["source_errors"] == ["Nimbus endpoint timed out"]
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["pending_work"] == 4
+
+
+def test_web_discovery_reports_a_live_daemon(monkeypatch, tmp_path) -> None:
+    """A fresh heartbeat is what turns "empty" into "caught up"."""
+    database = tmp_path / "alive.db"
+    store = SQLiteStore(database)
+    store.record_daemon_heartbeat(
+        at=datetime.now(UTC),
+        cycle=7,
+        entries_behind=0,
+        processed_lag_seconds=31.5,
+        head_lag_seconds=9.0,
+    )
+    _install(monkeypatch, _summary())
+
+    response = TestClient(create_app(database)).post(
+        "/v1/run/discovery", json={"max_probes": 5}
+    )
+
+    daemon = response.json()["daemon"]
+    assert daemon["running"] is True
+    assert daemon["cycle"] == 7
+    assert daemon["processed_lag_seconds"] == 31.5
+
+
+def test_web_discovery_reports_a_stale_daemon(monkeypatch, tmp_path) -> None:
+    database = tmp_path / "stale.db"
+    store = SQLiteStore(database)
+    store.record_daemon_heartbeat(
+        at=datetime.now(UTC) - timedelta(hours=1), cycle=3
+    )
+    _install(monkeypatch, _summary())
+
+    response = TestClient(create_app(database)).post(
+        "/v1/run/discovery", json={"max_probes": 5}
+    )
+
+    daemon = response.json()["daemon"]
+    assert daemon["running"] is False
+    assert daemon["cycle"] == 3
+    assert daemon["age_seconds"] >= 3600
 
 
 def test_discovery_log_endpoint_returns_daemon_tail(tmp_path) -> None:

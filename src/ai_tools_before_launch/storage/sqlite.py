@@ -9,6 +9,7 @@ implementation lives in sibling modules by responsibility:
 * :mod:`~ai_tools_before_launch.storage.observations` — probe history and due domains
 * :mod:`~ai_tools_before_launch.storage.candidates` — identities, versions, verifications
 * :mod:`~ai_tools_before_launch.storage.reviews` — decisions and priority snapshots
+* :mod:`~ai_tools_before_launch.storage.daemon` — ingest daemon liveness
 * :mod:`~ai_tools_before_launch.storage.metrics` — funnel counts
 """
 
@@ -21,13 +22,48 @@ from ai_tools_before_launch.domain.candidates import Candidate
 from ai_tools_before_launch.domain.review_queue import ReviewQueueItem
 from ai_tools_before_launch.storage.candidates import CandidateStore
 from ai_tools_before_launch.storage.ct_work import CTDiscoveryWorkLease, CTWorkStore
+from ai_tools_before_launch.storage.daemon import DaemonHeartbeat, DaemonStore
 from ai_tools_before_launch.storage.database import DatabaseBase
 from ai_tools_before_launch.storage.metrics import MetricsStore
 from ai_tools_before_launch.storage.observations import ObservationStore
 from ai_tools_before_launch.storage.reviews import ConcurrentDecisionError, ReviewStore
 from ai_tools_before_launch.storage.source_events import SourceEventStore
 
-__all__ = ["CTDiscoveryWorkLease", "ConcurrentDecisionError", "DomainSnapshot", "SQLiteStore"]
+__all__ = [
+    "CTDiscoveryWorkLease",
+    "ConcurrentDecisionError",
+    "DaemonHeartbeat",
+    "DomainSnapshot",
+    "SQLiteStore",
+]
+
+# The ops overview read, exposed so a test can pin its query plan.
+#
+# This is the one query whose shape decides whether the console survives a real
+# database. It is a correlated subquery over ``observations``, and it is only
+# index-seekable while ``idx_observations_domain`` exists and the subquery keeps
+# the ``domain = ? ORDER BY id DESC LIMIT 1`` shape. Both are easy to break by
+# accident, and nothing else in the suite would notice: correctness is
+# unaffected, only the cost.
+DOMAIN_SNAPSHOT_SQL = """
+    SELECT domains.domain,
+           domains.first_seen_at,
+           observations.observed_at,
+           observations.outcome_code,
+           observations.attempt_number,
+           observations.status_code,
+           observations.final_url,
+           observations.detail
+    FROM domains
+    LEFT JOIN observations ON observations.id = (
+        SELECT id
+        FROM observations AS latest
+        WHERE latest.domain = domains.domain
+        ORDER BY latest.id DESC
+        LIMIT 1
+    )
+    ORDER BY domains.domain
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +87,7 @@ class SQLiteStore(
     ObservationStore,
     CandidateStore,
     ReviewStore,
+    DaemonStore,
     MetricsStore,
 ):
     """Append-only local persistence for source signals and observations."""
@@ -59,30 +96,11 @@ class SQLiteStore(
         """Every domain with its first-seen time and latest probe outcome.
 
         One query instead of one per domain: the ops view asks for this on
-        every poll, and the table is large.
+        every poll, and the table is large. The SQL lives in
+        :data:`DOMAIN_SNAPSHOT_SQL` so its plan can be asserted.
         """
         with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT domains.domain,
-                       domains.first_seen_at,
-                       observations.observed_at,
-                       observations.outcome_code,
-                       observations.attempt_number,
-                       observations.status_code,
-                       observations.final_url,
-                       observations.detail
-                FROM domains
-                LEFT JOIN observations ON observations.id = (
-                    SELECT id
-                    FROM observations AS latest
-                    WHERE latest.domain = domains.domain
-                    ORDER BY latest.id DESC
-                    LIMIT 1
-                )
-                ORDER BY domains.domain
-                """
-            ).fetchall()
+            rows = connection.execute(DOMAIN_SNAPSHOT_SQL).fetchall()
         return tuple(
             DomainSnapshot(
                 domain=row["domain"],

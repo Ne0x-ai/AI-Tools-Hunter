@@ -48,11 +48,19 @@ class CTPollResult:
 
 CTPageFetcher = Callable[[str | None], Awaitable[CTPage]]
 
+CT_SOURCE_NAME = "ct_log"
+"""The ``source_cursors`` key every CT reader and writer agrees on.
+
+Exported because the console reads the cursor without owning a poller: making
+the daemon and the console key off two different strings would silently split
+the cursor in two.
+"""
+
 
 class CTPoller:
     """Convert CT pages to idempotent events in the local store."""
 
-    source_name = "ct_log"
+    source_name = CT_SOURCE_NAME
 
     def __init__(self, *, store: SQLiteStore, fetch_page: CTPageFetcher) -> None:
         self._store = store

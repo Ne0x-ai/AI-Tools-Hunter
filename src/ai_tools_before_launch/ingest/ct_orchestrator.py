@@ -26,7 +26,7 @@ from datetime import UTC, datetime, timedelta
 from ai_tools_before_launch.domain.retry_policy import network_retry_delay
 from ai_tools_before_launch.domain.verification import CandidateVerification
 from ai_tools_before_launch.filter.pipeline import CandidateFilter, FilterDecision, FilteredCandidate
-from ai_tools_before_launch.ingest.ct_poller import CTPoller, CTPollResult
+from ai_tools_before_launch.ingest.ct_poller import CT_SOURCE_NAME, CTPoller, CTPollResult
 from ai_tools_before_launch.llm.provider import LLMProvider
 from ai_tools_before_launch.pipeline import AIToolsBeforeLaunchPipeline, enrich_candidate_with_llm
 from ai_tools_before_launch.storage.sqlite import SQLiteStore
@@ -57,8 +57,8 @@ class CTIngestOrchestrator:
         self,
         *,
         store: SQLiteStore,
-        poller: CTPoller,
         pipeline: AIToolsBeforeLaunchPipeline,
+        poller: CTPoller | None = None,
         filter_pipeline: CandidateFilter | None = None,
         require_first_seen: bool = False,
         probe_limit: int = 50,
@@ -71,6 +71,10 @@ class CTIngestOrchestrator:
 
         RDAP outages ignore it and follow the shared network schedule instead —
         see :meth:`_retry_delay_for`.
+
+        ``poller`` is optional because the console is not allowed to ingest CT:
+        it only drains work the daemon already queued. Passing a poller is what
+        makes ``run_once(poll=True)`` legal, and only the daemon does that.
         """
         if probe_limit < 1:
             raise ValueError("probe_limit must be positive")
@@ -89,6 +93,11 @@ class CTIngestOrchestrator:
         self._probe_concurrency = probe_concurrency
         self._filter_retry_delay = filter_retry_delay
 
+    @property
+    def source_name(self) -> str:
+        """The cursor key shared with the daemon, poller present or not."""
+        return self._poller.source_name if self._poller is not None else CT_SOURCE_NAME
+
     async def run_once(
         self, *, observed_at: datetime | None = None, poll: bool = True
     ) -> CTIngestRunSummary:
@@ -96,8 +105,14 @@ class CTIngestOrchestrator:
 
         ``poll=False`` runs a digest-only round against whatever the
         continuous runner has already ingested — that lets ``start``
-        sweep pages and produce candidates at the same time.
+        sweep pages and produce candidates at the same time, and it is the
+        only mode the console is allowed to use: CT ingestion has exactly one
+        writer, the daemon.
         """
+        if poll and self._poller is None:
+            raise ValueError(
+                "poll=True requires a poller: only the ingest daemon may read CT logs"
+            )
         stamp = observed_at or datetime.now(UTC)
         if poll:
             domains_before = set(self._store.list_domains())
@@ -111,7 +126,7 @@ class CTIngestOrchestrator:
             new_roots = sorted(domains_after - domains_before)
         else:
             poll_result = CTPollResult(
-                next_cursor=self._store.get_source_cursor(self._poller.source_name),
+                next_cursor=self._store.get_source_cursor(self.source_name),
                 certificates_seen=0,
                 events_seen=0,
                 events_added=0,

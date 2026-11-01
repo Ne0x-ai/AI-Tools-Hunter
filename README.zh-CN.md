@@ -18,15 +18,10 @@ Product Hunt 上的条目、GitHub 上的 star，都要等有人决定去推广�
 
 ## 工作原理
 
-![AI Tools Before Launch 架构图](docs/architecture.png)
+![AI Tools Before Launch 架构图](docs/architecture.svg)
 
-<details>
-<summary>打开交互式架构图</summary>
-
-[`docs/architecture.html`](docs/architecture.html) —— 可探索节点、追踪链路、切换主题。
-由 [Archify](https://github.com/tt-a1i/archify) 生成。
-
-</details>
+`start` 是 ingest 表的唯一写者。`serve` 只读这些表，只写 review 决策，
+所以两个进程不会争抢游标。图源是 [`docs/architecture.json`](docs/architecture.json)。
 
 流水线从左到右依次流转：
 
@@ -34,8 +29,8 @@ Product Hunt 上的条目、GitHub 上的 star，都要等有人决定去推广�
 |---|---|
 | CT 日志 | 轮询配置的 RFC 6962 日志（默认：Cloudflare Nimbus 2026） |
 | 首见基线 | `ct_seen_domains` —— 第一次见到才是信号 |
-| S1 静态特征 | 域名形态：像品牌名 vs 随机垃圾域名 |
-| S2 RDAP 年龄 | ≤30 天 → 第一档 · ≤90 天 → 第二档 · 更老 → 丢弃 |
+| S1 静态特征 | 域名形态打分：像品牌名 vs 随机垃圾域名（默认只写证据，`--min-name-score` 才让它真拦人） |
+| S2 RDAP 年龄 | ≤30 天 → 第一档 · ≤90 天 → 第二档 · 更老 → 丢弃（端点表来自 IANA bootstrap，覆盖 1200+ TLD） |
 | S3 DNS 是否存在 | 域名到底能不能解析？ |
 | S4 实时探测 | 有边界的 HTTP 探测，带 SSRF 防护，输出证据引文 |
 | S5 LLM 分类 | 可选，固定 schema，证据受限 |
@@ -102,7 +97,14 @@ ai-tools-before-launch serve --database ./ai-tools-before-launch.db
 
 首页就是候选收件箱：未决候选按审核优先级排序。点进某个候选可以看到已持久化的
 证据，然后批准、暂缓、拒绝或加入黑名单。操作需要带上 `X-Actor-ID`，并会记录进
-SQLite。"扫描新网站"按钮会通过 `POST /v1/run/discovery` 触发一次严格的 CT 扫描。
+SQLite。
+
+**控制台不读 CT 日志。** 采集只有一个写入者 —— `start` 守护进程；跑两个意味着
+两个进程推进同一个游标。`serve` 只能**消化**守护进程已经放进队列的工作项
+（`POST /v1/run/discovery`），并且它会告诉你当前属于哪种情况：`no_work` 且
+`daemon.running: false` 表示根本没有人在采集；`no_work` 且
+`daemon.running: true` 表示你已经追平了。在另一个终端里（或用 systemd/launchd）
+跑 `start`，控制台才有东西可看。
 
 ### `start` 的行为
 
@@ -117,6 +119,34 @@ RDAP 服务器的限速；几个并发旋钮（`--rdap-concurrency`、`--dns-con
 `--probe-concurrency`、`--page-fetch-concurrency`）用来在速度和"礼貌"之间取舍，
 `--filter-retry-delay` 控制失败的 DNS/RDAP 检查多快会被重新排队重试。
 
+## 你到底有多早？
+
+这是整个项目唯一真正重要的数字，所以它每一轮都会吐出来，而不是靠感觉。每个
+cycle 的 `start.cycle` 事件里有一个 `freshness` 对象，三个量回答三个不同的问题：
+
+| 字段 | 回答什么 | 归谁 |
+|---|---|---|
+| `entries_behind` | 日志已经发布、但游标还没消化的条数 | 你的债 —— 可行动 |
+| `processed_lag_seconds` | 你最新消化掉的那条，距今多少秒 | 你的债 + 日志自身的延迟 = 这次发现真实有多早 |
+| `head_lag_seconds` | 直接读日志最尾部那条的年龄 | 日志的延迟 —— 这是任何人从 CT 都不可能突破的下限 |
+
+```jsonc
+{"event": "start.cycle", "cycle": 7, "freshness": {
+  "entries_behind": 0, "processed_lag_seconds": 41.2, "head_lag_seconds": 41.2,
+  "logs": [{"log": "cloudflare-nimbus2026", "tree_size": 981234567,
+            "cursor": 981234567, "entries_behind": 0,
+            "processed_lag_seconds": 41.2, "head_lag_seconds": 41.2}]}}
+```
+
+`entries_behind > 0` 说明**你**是瓶颈（日志尾部明明更新了，你没跟上），这时会额外
+吐一条 `start.lagging`，并提示去调 `--page-fetch-concurrency` / `--page-size`。
+`entries_behind == 0` 而 `head_lag_seconds` 仍然很大，说明是日志自己慢 —— 那不是
+bug，那是这个方法的物理下限，调参也改不了。默认阈值为 120 秒
+（`--lag-warn-seconds`）。
+
+一个诚实的注意点：冷启动补历史（`--entries`）期间 `entries_behind` 天然很大，
+警告会一直响 —— 那是真的落后，不是误报。
+
 ## HTTP API
 
 默认只监听回环地址，除非指定 `--host 0.0.0.0`。API **没有任何认证** —— 如果绑定到
@@ -130,8 +160,9 @@ RDAP 服务器的限速；几个并发旋钮（`--rdap-concurrency`、`--dns-con
 | `GET` | `/v1/candidates/{id}/versions/{v}/review-context` | 不可变的历史版本 |
 | `POST` | `/v1/candidates/{id}/versions/{v}/decisions` | 基于 `request_id` 幂等 |
 | `POST` | `/v1/candidates/{id}/versions/{v}/decisions/{d}/revoke` | 撤销一次决策 |
-| `POST` | `/v1/run/discovery` | 一次严格的 CT 扫描 |
-| `GET` | `/v1/discovery/overview` | 域名数、游标、漏斗统计 |
+| `POST` | `/v1/run/discovery` | 消化队列里到期的工作项（不读 CT） |
+| `GET` | `/v1/discovery/overview` | 域名数、游标、漏斗统计、守护状态 |
+| `GET` | `/v1/discovery/log` | 守护进程日志的尾部 |
 | `GET` | `/healthz` | `{"ok": true}` |
 
 ## 7×24 常驻运行

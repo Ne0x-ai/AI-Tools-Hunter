@@ -401,7 +401,12 @@ class CTLogFetcher:
         return sizes
 
     async def leaf_timestamp(self, log_id: str, index: int) -> datetime | None:
-        """Fetch one entry and return its certificate ``notBefore`` (UTC)."""
+        """Fetch one entry and return its **log-submission** timestamp (UTC).
+
+        This is the time the log accepted the entry, not the certificate's
+        ``notBefore``: CAs backdate and batch-issue, so ``notBefore`` is far
+        too noisy to date a sighting with.
+        """
         for log in self._logs:
             if log.log_id == log_id:
                 entries = await self._get_entries(log, index, index)
